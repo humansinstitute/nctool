@@ -30,14 +30,14 @@ export async function sendNote({ ndk, signer, npub, powBits, timeoutMs }) {
     const { data: pubHex } = nip19.decode(npub);
     const filter = {
         authors: [pubHex],
-        kinds: [1],
+        kinds: [0, 1],
         limit: 10
     };
     const events = await ndk.fetchEvents(filter, { timeoutSec: 5 });
-    console.log(`\n📝 Latest 10 notes by ${npub}:\n`);
+    console.log(`\n📝 Latest 10 events by ${npub} (kinds 0 & 1):\n`);
     [...events]
         .sort((a, b) => b.created_at - a.created_at)
         .forEach((e, i) => {
-            console.log(`${i + 1}. ${e.content}\n`);
+            console.log(`${i + 1}. [${e.kind}] ${e.content} (id: ${e.id}, created_at: ${e.created_at})\n`);
         });
 }
