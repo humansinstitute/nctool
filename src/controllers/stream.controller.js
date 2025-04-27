@@ -1,9 +1,18 @@
+
 import { asyncHandler } from '../middlewares/asyncHandler.js';
 import { startSession, getSession, stopSession } from '../services/stream.service.js';
 
 export const startStream = asyncHandler(async (req, res) => {
-    const { npub } = req.body ?? {};
-    const sessionId = await startSession(npub);
+    // Expect an array of npubs in the request body
+    const { npubs } = req.body ?? {};
+
+    // Validate that npubs is an array if provided
+    if (npubs && !Array.isArray(npubs)) {
+        return res.status(400).json({ error: 'npubs must be an array of strings' });
+    }
+
+    // Pass the array (or undefined if not provided) to the service
+    const sessionId = await startSession(npubs);
     res.json({ sessionId });
 });
 

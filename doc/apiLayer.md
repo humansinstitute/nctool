@@ -104,6 +104,79 @@ curl -X POST http://localhost:3000/pow \
 
 ---
 
+## Stream
+
+### POST /stream/start
+Initiates a new Nostr event streaming session. Accepts an optional array of author public keys.
+
+**Body Parameters**  
+| Name  | Type     | Required | Description                                  |
+|-------|----------|----------|----------------------------------------------|
+| npubs | string[] | No       | Array of Nostr public keys in `npub` format. |
+
+```bash
+curl -X POST http://localhost:3000/stream/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "npubs": ["npub1...", "npub2..."]
+  }'
+```
+
+**Response 200**
+```json
+{ "sessionId": "session1234" }
+```
+
+**Response 400**
+```json
+{ "error": "npubs must be an array of strings" }
+```
+
+---
+
+### GET /stream/events/:id
+Connects to an active stream session and receives events via Server-Sent Events (SSE).
+
+**Path Parameters**  
+| Name | Type   | Required | Description                                |
+|------|--------|----------|--------------------------------------------|
+| id   | string | Yes      | Session ID returned by `/stream/start`.    |
+
+```bash
+curl http://localhost:3000/stream/events/session1234
+```
+
+**Response 200**
+
+- Headers: `Content-Type: text/event-stream`, `Connection: keep-alive`, `Cache-Control: no-cache`  
+- Body: Server-Sent Events with each event as `data:{nostr_event_json}\n\n`
+
+**Response 404**
+```json
+{ "error": "Session not found" }
+```
+
+---
+
+### DELETE /stream/stop/:id
+Stops an active stream session.
+
+**Path Parameters**  
+| Name | Type   | Required | Description                                |
+|------|--------|----------|--------------------------------------------|
+| id   | string | Yes      | Session ID returned by `/stream/start`.    |
+
+```bash
+curl -X DELETE http://localhost:3000/stream/stop/session1234
+```
+
+**Response 200**
+```json
+{ "stopped": true }
+```
+
+---
+
 ## Posts
 
 ### POST /post
@@ -185,6 +258,7 @@ Retrieves the latest 10 posts by the current keypair.
 | Name | Type   | Required | Description                          |
 |------|--------|----------|--------------------------------------|
 | kind | number | No       | Filter by event kind (`0` or `1`)   |
+| npub | string | No       | Filter by author public key (`npub` format) |
 
 ```bash
 curl http://localhost:3000/post/view10?kind=1
@@ -283,12 +357,14 @@ Updates metadata for the current keypair (kind=0).
 |---------|--------|----------|---------------------------------|
 | name    | string | Yes      | Display name                    |
 | about   | string | Yes      | About or bio text               |
+| npub    | string | Yes      | Public key in Nostr `npub` format identifying which profile to update |
 | picture | string | No       | URL of profile picture          |
 
 ```bash
 curl -X POST http://localhost:3000/profile/update \
   -H "Content-Type: application/json" \
   -d '{
+    "npub": "npub1...",
     "name": "Bob",
     "about": "Developer",
     "picture": "https://example.com/avatar.png"

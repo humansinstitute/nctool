@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import axios from 'axios';
 import readline from 'readline';
-import * as EventSourceModule from 'eventsource';
-const EventSource = EventSourceModule.default ?? EventSourceModule;
+import { EventSource } from 'eventsource';
 import { connect } from './src/services/nostr.service.js';
 import { getAllKeys, generateKeyPair } from './src/services/identity.service.js';
 import { nip19 } from 'nostr-tools';
@@ -45,12 +44,17 @@ async function chooseKey() {
   }
 }
 
-async function tailEvents(sessionKey) {
-  // 1. tell API to spin up (or reuse) the SSE session
+async function tailEvents() { // Removed sessionKey as direct param, we get all keys now
+  // 1. Get all known npubs
+  const allKeys = getAllKeys();
+  const allNpubs = allKeys.map(key => key.npub);
+
+  // 2. tell API to spin up (or reuse) the SSE session, providing all npubs
   let sessionId;
   try {
+    // Send the array of all npubs to the backend
     const resp = await axios.post(`${API_BASE}/stream/start`, {
-      npub: sessionKey.npub
+      npubs: allNpubs
     });
     sessionId = resp.data.sessionId;
   } catch (err) {
@@ -58,29 +62,81 @@ async function tailEvents(sessionKey) {
     return;
   }
 
-  console.log('\n🕑 Waiting for data – press Q to quit\n');
+  console.log('\n🕑 Waiting for data from authors:', allNpubs.join(', '), '– press Q to quit\n');
 
-  // 2. open the stream
+  // 3. open the stream
   const es = new EventSource(`${API_BASE}/stream/events/${sessionId}`);
-  es.onmessage = ev => console.log('🆕', ev.data);
+  es.onmessage = ev => {
+    try {
+      const eventData = JSON.parse(ev.data);
+      // Optionally format the output to show who sent the event
+      const authorNpub = nip19.npubEncode(eventData.pubkey);
+      console.log(`🆕 [from: ${authorNpub}]`, eventData.content);
+    } catch (parseError) {
+      console.log('🆕 Raw:', ev.data); // Fallback for non-JSON data
+    }
+  };
   es.onerror = err => console.error('Stream error:', err);
 
-  // 3. capture a single keypress
+  // 4. capture a single keypress
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  process.stdin.resume(); // Resume stdin so keypress events are emitted
 
-  await new Promise(resolve => {
-    const onKey = (_, key) => {
-      if (key.name === 'q' || key.name === 'Q') {
-        es.close();
-        axios.delete(`${API_BASE}/stream/stop/${sessionId}`).catch(() => { });
-        process.stdin.setRawMode(false);
-        process.stdin.off('keypress', onKey);
-        console.log('\n⏹  Subscription stopped.\n');
-        resolve();
+  await new Promise((resolve, reject) => { // Added reject for potential errors
+    const cleanupAndExit = (exitCode = 0, message = '\n⏹  Subscription stopped.\n') => {
+      try {
+        es.close(); // Close EventSource connection
+        axios.delete(`${API_BASE}/stream/stop/${sessionId}`).catch(err => console.error("Error stopping backend stream:", err.message)); // Tell backend to stop
+        if (process.stdin.isTTY) {
+          process.stdin.setRawMode(false); // Turn off raw mode IMPORTANT: Check if TTY first
+          process.stdin.pause(); // Pause stdin to restore normal mode
+        }
+        process.stdin.off('keypress', onKey); // Remove the listener
+        console.log(message);
+        if (exitCode !== null) { // Allow resolving without exiting if needed
+          process.exit(exitCode); // Exit the process for Ctrl+C
+        } else {
+          resolve(); // Resolve promise for 'q'
+        }
+      } catch (cleanupError) {
+        console.error("Error during cleanup:", cleanupError);
+        process.exit(1); // Exit with error if cleanup fails
       }
     };
+
+    const onKey = (_, key) => {
+      // Handle 'q' or 'Q'
+      if (key && (key.name === 'q' || key.name === 'Q')) {
+        cleanupAndExit(null); // Resolve promise, don't force exit code
+      }
+      // Handle Ctrl+C
+      else if (key && key.ctrl && key.name === 'c') {
+        cleanupAndExit(0, '\n⏹  Subscription stopped (Ctrl+C).\n'); // Exit with code 0
+      }
+      // Handle Ctrl+D (often EOF)
+      else if (key && key.ctrl && key.name === 'd') {
+        cleanupAndExit(0, '\n⏹  Subscription stopped (Ctrl+D).\n'); // Exit with code 0
+      }
+    };
+
     process.stdin.on('keypress', onKey);
+
+    // Also handle potential errors on stdin
+    process.stdin.on('error', (err) => {
+      console.error("Stdin error:", err);
+      cleanupAndExit(1, '\n⏹  Subscription stopped due to input error.\n');
+    });
+
+    // Handle case where stdin closes unexpectedly
+    process.stdin.on('close', () => {
+      // Check if EventSource is still open before trying to close
+      if (es && es.readyState !== EventSource.CLOSED) {
+        cleanupAndExit(0, '\n⏹  Subscription stopped (input closed).\n');
+      } else {
+        resolve(); // Already closing/closed
+      }
+    });
   });
 }
 
@@ -191,7 +247,8 @@ async function main() {
             );
           });
       } else if (choice === '5') {
-        await tailEvents(sessionKey);
+        // No longer need to pass sessionKey, tailEvents gets all keys itself
+        await tailEvents();
         continue;
       } else if (choice === 'e') {
         console.log('Exiting.');
