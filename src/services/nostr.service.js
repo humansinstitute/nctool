@@ -1,6 +1,6 @@
 import NDK, { NDKPrivateKeySigner } from "@nostr-dev-kit/ndk";
 import { nip19 } from "nostr-tools";
-import { getKeys } from "./identity.service.js";
+import { getAllKeys } from "./identity.service.js";
 
 let connection = null;
 
@@ -8,17 +8,19 @@ let connection = null;
  * Connects to Nostr relays with a singleton NDK instance.
  * @returns {Promise<{ ndk: NDK, signer: NDKPrivateKeySigner, npub: string }>}
  */
-export async function connect() {
+export async function connect(keyObj) {
+    if (!keyObj) {
+        const all = getAllKeys();
+        if (!all.length) {
+            throw new Error("No keys available; generate keys first");
+        }
+        keyObj = all[0];
+    }
     if (connection) {
         return connection;
     }
 
-    const keys = getKeys();
-    if (!keys) {
-        throw new Error("Keys not found; generate keys first via /id/generateKey");
-    }
-
-    const { nsec, npub } = keys;
+    const { nsec, npub } = keyObj;
     const { data: privhex } = nip19.decode(nsec);
     const signer = new NDKPrivateKeySigner(privhex);
 

@@ -3,6 +3,7 @@ import { mineEventPow } from '../services/pow.service.js';
 import { NDKEvent, NDKKind } from '@nostr-dev-kit/ndk';
 import { nip19 } from 'nostr-tools';
 import { asyncHandler } from '../middlewares/asyncHandler.js';
+import { getAllKeys } from '../services/identity.service.js';
 
 const DEFAULT_POW = Number(process.env.POW_BITS) || 20;
 const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 10000;
@@ -39,8 +40,13 @@ export const viewPosts = asyncHandler(async (req, res) => {
         kinds = [0, 1];
     }
 
-    const { ndk, npub } = await connect();
-    const { data: pubHex } = nip19.decode(npub);
+    const { ndk, npub: defaultNpub } = await connect();
+    let pubHex;
+    if (req.query.npub) {
+        pubHex = nip19.decode(req.query.npub).data;
+    } else {
+        pubHex = nip19.decode(defaultNpub).data;
+    }
 
     const filter = { authors: [pubHex], kinds, limit: 10 };
     const events = await ndk.fetchEvents(filter, { timeoutSec });
@@ -62,8 +68,10 @@ export const sendNoteController = asyncHandler(async (req, res) => {
     if (!npub || !content) {
         return res.status(400).json({ error: 'npub and content are required' });
     }
-
-    const { ndk } = await connect();
+    const keys = getAllKeys();
+    const keyObj = keys.find(k => k.npub === npub);
+    if (!keyObj) throw new Error("Unknown npub for note");
+    const { ndk } = await connect(keyObj);
     const noteEvent = new NDKEvent(ndk, { kind: NDKKind.Text, content });
     await noteEvent.sign();
 
