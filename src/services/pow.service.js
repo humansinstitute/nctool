@@ -8,10 +8,13 @@ import { NDKEvent } from "@nostr-dev-kit/ndk";
  * @param {number} difficulty - Required leading zero bits.
  * @returns {Promise<Object>} - The mined raw event data.
  */
-export function mineEventPow(evt, difficulty = 20) {
+export function mineEventPow(evtOrRaw, difficulty = 20) {
+    const serialized = typeof evtOrRaw.rawEvent === 'function'
+        ? evtOrRaw.rawEvent()
+        : evtOrRaw;
     return new Promise((resolve, reject) => {
         const worker = new Worker(new URL("./pow.service.js", import.meta.url), {
-            workerData: { serialised: evt.rawEvent(), difficulty }
+            workerData: { serialised: serialized, difficulty }
         });
         worker.once("message", (mined) => resolve(mined));
         worker.once("error", reject);
