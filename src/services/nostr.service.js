@@ -21,7 +21,6 @@ export function buildTextNote(content) {
 const DEFAULT_POW = Number(process.env.POW_BITS) || 0;
 const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 5000;
 
-let connection = null;
 
 /**
  * Connects to Nostr relays with a singleton NDK instance.
@@ -35,10 +34,6 @@ export async function connect(keyObj) {
         }
         keyObj = all[0];
     }
-    if (connection) {
-        return connection;
-    }
-
     const { nsec, npub } = keyObj;
     const { data: privhex } = nip19.decode(nsec);
     const signer = new NDKPrivateKeySigner(privhex);
@@ -71,8 +66,7 @@ export async function connect(keyObj) {
     );
     console.log("✅ NDK connected");
 
-    connection = { ndk, signer, npub };
-    return connection;
+    return { ndk, signer, npub };
 }
 
 export async function publishEncryptedEvent(

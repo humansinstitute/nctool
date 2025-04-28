@@ -21,6 +21,7 @@ npm install axios readline eventsource nostr-tools
 - `API_URL` (optional): Base URL for the API server (default: `http://localhost:3000`)
 - `POW_BITS` (optional): Default proof-of-work difficulty (default: `20`)
 - `TIMEOUT_MS` (optional): Default timeout for publishing events in milliseconds (default: `10000`)
+- `IGNORE_OLD` (optional): Milliseconds threshold for ignoring old messages (default: `no limit`)
 
 ## Running the Client
 
@@ -168,7 +169,7 @@ Prompts: `Enter a, b, c, d, f, 5 or e:`
 
 #### Option f) Sign event remotely
 1. Prompts:
-   - `Call NPub (target, default <sessionKey.npub>):`
+   - `Call NPub (target, default npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5):`
    - `Response NPub (default <sessionKey.npub>):`
    - `Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp):`
    - `Enter stringified Nostr event JSON`

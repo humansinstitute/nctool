@@ -154,7 +154,7 @@ curl http://localhost:3000/stream/events/session1234
 - Body: Server-Sent Events where each message is JSON. Decrypted kind `30078` actions arrive as:
 
   ```json
-  data:{"type":"decryptedAction","data":{"payload":{...},"senderNpub":"npub1...","responseNpub":"npub1..."}}
+  data:{"type":"decryptedAction","data":{"payload":{...},"senderNpub":"npub1...","responseNpub":"npub1...","timestamp":1714110000}}
   ```
 
   Other events are streamed in raw form.
@@ -297,6 +297,31 @@ curl -X POST http://localhost:3000/post/note_remote \
 ```
 
 ---
+
+### POST /post/broadcast
+
+**Description:** Accepts a fully signed Nostr event object and publishes it to configured relays.
+
+**Body Parameters**  
+| Name  | Type   | Required | Description                |
+|-------|--------|----------|----------------------------|
+| event | object | Yes      | Complete signed event JSON |
+
+```bash
+curl -X POST http://localhost:3000/post/broadcast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event": { "id": "...", "pubkey": "...", "sig": "...", ... }
+  }'
+```
+
+**Response 200**  
+```json
+{
+  "id": "eventid123",
+  "relays": ["wss://relay.example.com"]
+}
+```
 
 ### GET /post/view10
 Retrieves the latest 10 posts by the current keypair.

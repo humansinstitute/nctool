@@ -43,6 +43,7 @@ Follow the on-screen prompts to select an identity, update your profile, post no
 - `API_URL`: Base URL for the API server (default: `http://localhost:3000`)  
 - `POW_BITS`: Default proof-of-work difficulty (default: `20`)  
 - `TIMEOUT_MS`: Default timeout for publishing events in milliseconds (default: `10000`)  
+- `IGNORE_OLD`: Milliseconds threshold for ignoring old messages (default: no limit)  
 
 ## Documentation
 

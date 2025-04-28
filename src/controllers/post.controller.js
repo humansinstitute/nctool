@@ -121,9 +121,21 @@ export const sendNoteRemoteController = asyncHandler(async (req, res) => {
     const threadID = req.body.threadID || callID;
     const timestamp = Math.floor(Date.now() / 1000);
     // Construct a basic Kind 1 event
-    const pubHex = nip19.decode(signerNpub).data;
-    const eventObject = buildTextNote(noteContent, pubHex);
-    const eventPayloadString = JSON.stringify(eventObject);
+    const unsignedEvent = buildTextNote(noteContent);
+    // Add the signer's pubkey
+    try {
+        const { type, data: signerPubkeyHex } = nip19.decode(signerNpub);
+        if (type !== 'npub') {
+            throw new Error('Invalid signerNpub format');
+        }
+        unsignedEvent.pubkey = signerPubkeyHex;
+        console.log("DEBUG → unsignedEvent (with pubkey, before PoW):", unsignedEvent);
+    } catch (e) {
+        return res.status(400).json({ error: 'Invalid signerNpub provided', message: e.message });
+    }
+    // Construct and mine a basic Kind 1 event for proof-of-work
+    const minedRaw = await mineEventPow(unsignedEvent, powBits);
+    const eventPayloadString = JSON.stringify(minedRaw);
     const message = {
         callID,
         threadID,
@@ -136,4 +148,16 @@ export const sendNoteRemoteController = asyncHandler(async (req, res) => {
     };
     const result = await publishEncryptedEvent(senderNpub, callNpub, responseNpub, message, powBits, timeoutMs);
     res.json({ callID, id: result.id, relays: result.relays });
+});
+
+// Broadcast a fully signed event to relays
+export const broadcastEvent = asyncHandler(async (req, res) => {
+    const { event } = req.body;
+    if (!event) {
+        return res.status(400).json({ error: 'event is required' });
+    }
+    const { ndk } = await connect();
+    const ndkEvent = new NDKEvent(ndk, event);
+    const okRelays = await ndkEvent.publish(undefined, DEFAULT_TIMEOUT);
+    res.json({ id: ndkEvent.id, relays: [...okRelays].map(r => r.url) });
 });

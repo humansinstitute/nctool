@@ -62,7 +62,8 @@ export const streamEvents = (req, res) => {
                 data: {
                     payload: payloadObj,
                     senderNpub,
-                    responseNpub: response
+                    responseNpub: response,
+                    timestamp: ev.created_at
                 }
             };
             res.write(`data:${JSON.stringify(message)}\n\n`);

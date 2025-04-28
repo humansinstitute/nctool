@@ -1,14 +1,18 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import axios from 'axios';
 import readline from 'readline';
 import { EventSource } from 'eventsource';
 import { connect } from './src/services/nostr.service.js';
 import { getAllKeys, generateKeyPair, getPrivateKeyByNpub } from './src/services/identity.service.js';
 import { nip19, finalizeEvent } from 'nostr-tools';
+import { buildTextNote } from './src/services/nostr.service.js';
+import { mineEventPow } from './src/services/pow.service.js';
 import pkg from 'uuid';
 const { v4: uuidv4 } = pkg;
 
 const API_BASE = process.env.API_URL || 'http://localhost:3000';
+const IGNORE_OLD_MS = Number(process.env.IGNORE_OLD) || Infinity;
 
 function prompt(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -46,17 +50,16 @@ async function chooseKey() {
   }
 }
 
-async function tailEvents() { // Removed sessionKey as direct param, we get all keys now
+async function tailEvents(targetNpub) { // Removed sessionKey as direct param, we get all keys now
   // 1. Get all known npubs
-  const allKeys = getAllKeys();
-  const allNpubs = allKeys.map(key => key.npub);
+  const npubs = [targetNpub];
 
   // 2. tell API to spin up (or reuse) the SSE session, providing all npubs
   let sessionId;
   try {
     // Send the array of all npubs to the backend
     const resp = await axios.post(`${API_BASE}/stream/start`, {
-      npubs: allNpubs
+      npubs
     });
     sessionId = resp.data.sessionId;
   } catch (err) {
@@ -64,7 +67,7 @@ async function tailEvents() { // Removed sessionKey as direct param, we get all 
     return;
   }
 
-  console.log('\n🕑 Waiting for data from authors:', allNpubs.join(', '), '– press Q to quit\n');
+  console.log(`\n🕑 Waiting for data from author: ${targetNpub} – press Q to quit\n`);
 
   // 3. open the stream
   const es = new EventSource(`${API_BASE}/stream/events/${sessionId}`);
@@ -72,7 +75,16 @@ async function tailEvents() { // Removed sessionKey as direct param, we get all 
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'decryptedAction') {
-        const { payload: outer, senderNpub, responseNpub } = msg.data;
+        const { payload: outer, senderNpub, responseNpub, timestamp } = msg.data;
+        if (timestamp === undefined) {
+          console.log('Message is ignored - no timestamp');
+          return;
+        }
+        const ageMs = Date.now() - timestamp * 1000;
+        if (ageMs > IGNORE_OLD_MS) {
+          console.log('Message not signed as it is out of date');
+          return;
+        }
         const inner = outer.payload;
         if (inner.action === 'sign') {
           console.log(`🆕 Sign request from ${senderNpub}:`, inner);
@@ -291,15 +303,21 @@ async function main() {
         console.log('Encrypted action published:', actionResp.data);
       } else if (choice === 'f') {
         // Remote sign request via API
-        const callNpubInput = await prompt(`Call NPub (target, default ${sessionKey.npub}): `);
-        const callNpub = callNpubInput || sessionKey.npub;
+        const callNpubInput = await prompt('Call NPub (target, default npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5): ');
+        const callNpub = callNpubInput || 'npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5';
         const responseNpubInput = await prompt(`Response NPub (default ${sessionKey.npub}): `);
         const responseNpub = responseNpubInput || sessionKey.npub;
         const signerNpubInput = await prompt('Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp): ');
         const signerNpub = signerNpubInput || 'npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp';
         const noteContent = await prompt('Enter note content: ');
         try {
-          const remoteResp = await axios.post(`${API_BASE}/post/note_remote`, { senderNpub: sessionKey.npub, callNpub, responseNpub, signerNpub, noteContent });
+          const remoteResp = await axios.post(`${API_BASE}/post/note_remote`, {
+            senderNpub: sessionKey.npub,
+            callNpub,
+            responseNpub,
+            signerNpub,
+            noteContent
+          });
           console.log('Remote sign request sent:', remoteResp.data);
         } catch (err) {
           if (err.response) {
@@ -309,8 +327,8 @@ async function main() {
           }
         }
       } else if (choice === '5') {
-        // No longer need to pass sessionKey, tailEvents gets all keys itself
-        await tailEvents();
+        // Subscribe only to events for this user's npub
+        await tailEvents(sessionKey.npub);
         continue;
       } else if (choice === 'e') {
         console.log('Exiting.');
