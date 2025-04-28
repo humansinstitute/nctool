@@ -1,6 +1,6 @@
 # Test Client Documentation
 
-This document describes the workings of the `index.js` test client, which provides a CLI for interacting with the Nostr API layer (see `doc/apiLayer.md`). It covers flows for identity selection, profile updates, posting, viewing posts, publishing actions, real-time streaming, and error handling.
+This document describes the workings of the `index.js` test client, which provides a CLI for interacting with the Nostr API layer (see `doc/apiLayer.md`). It covers flows for identity selection, profile updates, posting, viewing posts, publishing encrypted actions, real-time streaming, and error handling.
 
 ## Prerequisites
 
@@ -64,7 +64,7 @@ Hello <name>, what would you like to do?
 a) Update profile
 b) Create a post
 c) View last 10 posts
-d) Publish action
+d) Publish encrypted action
 5) Subscribe for Data Input
 e) Exit
 ```
@@ -130,47 +130,60 @@ Prompts: `Enter a, b, c, d, 5 or e:`
    axios.post('/action/take', payload);
    ```
 
-#### Option d) Publish Action
+#### Option d) Publish encrypted action
 
-1. Prompts: `Enter JSON payload or leave blank for default`
+1. Prompts:
+   - `Call NPub (target):`
+   - `Response NPub (default <sessionKey.npub>):`
+   - `Enter JSON payload or leave blank for default`
 2. Default payload:
    ```json
    {
-     cmd: "pay",
-     target: "<npub>",
-     amount: "21000"
+     "cmd": "pay",
+     "target": "<callNpub>",
+     "amount": "21000"
    }
    ```
 3. Parses input JSON, aborts on invalid JSON.
-4. Connects to Nostr (`connect(sessionKey)`).
-5. Calls `POST /action`:
+4. Calls:
+   ```
+   POST /action/encrypted
+   ```
+   with body:
    ```json
-   { dTag: "avalon:task:10002929", payload, powBits, timeoutMs }
+   {
+     "senderNpub": "<sessionKey.npub>",
+     "callNpub": "<callNpub>",
+     "responseNpub": "<responseNpub>",
+     "payload": { ... },
+     "powBits": <powBits>,
+     "timeoutMs": <timeoutMs>
+   }
    ```
-6. Logs:
+5. Logs:
    ```
-   Action published: <response data>
+   Encrypted action published: <response data>
    ```
-7. Fetches latest events via NDK:
-   ```js
-   ndk.fetchEvents({ authors: [<pubHex>], kinds: [0,1,30078], limit: 10 })
-   ```
-   Sorts and prints them.
 
 #### Option 5) Subscribe for Data Input (`tailEvents`)
 
 1. Retrieves all `npub` keys.
-2. Calls `POST /stream/start` with `npubs` array.
+2. Calls `POST /stream/start` with `npubs` array (backend filters and decrypts for these npubs).
 3. Receives `sessionId`.
 4. Opens SSE:
    ```
    GET /stream/events/<sessionId>
    ```
 5. On each `message`:
-   - Parses `eventData`
-   - Logs:
+   - Parses the JSON message.
+   - If `msg.type === 'decryptedAction'`:
      ```
-     🆕 [from: <npub>] <eventData.content>
+     🆕 Decrypted payload from <senderNpub>: <payload>
+         (Respond to: <responseNpub>)
+     ```
+   - Else logs raw message:
+     ```
+     🆕 Raw message: <msg>
      ```
 6. Waits for keypress:
    - `q` or `Q`: stop and return to menu.

@@ -1,6 +1,10 @@
-import NDK, { NDKPrivateKeySigner } from "@nostr-dev-kit/ndk";
-import { nip19 } from "nostr-tools";
+import NDK, { NDKPrivateKeySigner, NDKEvent } from "@nostr-dev-kit/ndk";
+import { nip19, nip04 } from "nostr-tools";
 import { getAllKeys } from "./identity.service.js";
+import { mineEventPow } from "./pow.service.js";
+
+const DEFAULT_POW = Number(process.env.POW_BITS) || 0;
+const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 5000;
 
 let connection = null;
 
@@ -54,4 +58,55 @@ export async function connect(keyObj) {
 
     connection = { ndk, signer, npub };
     return connection;
+}
+
+export async function publishEncryptedEvent(
+    senderNpub,
+    callNpub,
+    responseNpub,
+    payloadObject,
+    powBits = DEFAULT_POW,
+    timeoutMs = DEFAULT_TIMEOUT
+) {
+    // Find the sender's key object
+    const keys = getAllKeys();
+    const senderKeyObj = keys.find(k => k.npub === senderNpub);
+    if (!senderKeyObj) {
+        throw new Error(`Unknown sender npub: ${senderNpub}`);
+    }
+    const { data: senderPrivHex } = nip19.decode(senderKeyObj.nsec);
+    // Decode recipient public key hex
+    const { data: recipientPubHex } = nip19.decode(callNpub);
+    // Encrypt the payload
+    const encryptedPayload = await nip04.encrypt(
+        senderPrivHex,
+        recipientPubHex,
+        JSON.stringify(payloadObject)
+    );
+    // Construct Nostr event content
+    const content = JSON.stringify({
+        call: callNpub,
+        response: responseNpub,
+        payload: encryptedPayload
+    });
+    // Establish connection and signer
+    const { ndk, signer } = await connect(senderKeyObj);
+    // Prepare tags for relay filtering
+    const tags = [['p', recipientPubHex]];
+    // Create and sign the event
+    const event = new NDKEvent(ndk, { kind: 30078, tags, content });
+    await event.sign(signer);
+    // Apply proof-of-work if required
+    const rawEvent = powBits > 0
+        ? await mineEventPow(event, powBits)
+        : event.rawEvent();
+    const finalEvent = powBits > 0
+        ? new NDKEvent(ndk, rawEvent)
+        : event;
+    if (powBits > 0) {
+        await finalEvent.sign(signer);
+    }
+    // Publish and return result
+    const okRelays = await finalEvent.publish(undefined, timeoutMs);
+    return { id: finalEvent.id, relays: [...okRelays].map(r => r.url) };
 }

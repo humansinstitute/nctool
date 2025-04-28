@@ -114,6 +114,8 @@ Initiates a new Nostr event streaming session. Accepts an optional array of auth
 |-------|----------|----------|----------------------------------------------|
 | npubs | string[] | No       | Array of Nostr public keys in `npub` format. |
 
+*Note:* The server uses these NPub keys to subscribe to relays with a `#p` tag filter on kind `30078` events, ensuring only messages addressed to these recipients are streamed.
+
 ```bash
 curl -X POST http://localhost:3000/stream/start \
   -H "Content-Type: application/json" \
@@ -149,7 +151,13 @@ curl http://localhost:3000/stream/events/session1234
 **Response 200**
 
 - Headers: `Content-Type: text/event-stream`, `Connection: keep-alive`, `Cache-Control: no-cache`  
-- Body: Server-Sent Events with each event as `data:{nostr_event_json}\n\n`
+- Body: Server-Sent Events where each message is JSON. Decrypted kind `30078` actions arrive as:
+
+  ```json
+  data:{"type":"decryptedAction","data":{"payload":{...},"senderNpub":"npub1...","responseNpub":"npub1..."}}
+  ```
+
+  Other events are streamed in raw form.
 
 **Response 404**
 ```json
@@ -341,6 +349,44 @@ curl -X POST http://localhost:3000/action \
 ```json
 {
   "id": "eventid456",
+  "relays": ["wss://relay.example.com"]
+}
+```
+
+---
+
+### POST /action/encrypted
+
+**POST** /action/encrypted  
+Publishes a NIP-04 encrypted kind 30078 event.
+
+**Body Parameters**  
+| Name         | Type       | Required | Description                                                    |
+|--------------|------------|----------|----------------------------------------------------------------|
+| senderNpub   | string     | Yes      | Nostr `npub` of the sender                                     |
+| callNpub     | string     | Yes      | Nostr `npub` of the message recipient                          |
+| responseNpub | string     | Yes      | Nostr `npub` of where to send the response                     |
+| payload      | object     | Yes      | Payload object to encrypt                                       |
+| powBits      | number     | No       | POW bits (default: `process.env.POW_BITS`)                     |
+| timeoutMs    | number     | No       | Publish timeout in ms (default: `process.env.TIMEOUT_MS`)      |
+
+```bash
+curl -X POST http://localhost:3000/action/encrypted \
+  -H "Content-Type: application/json" \
+  -d '{
+    "senderNpub": "npub1...",
+    "callNpub": "npub2...",
+    "responseNpub": "npub3...",
+    "payload": { "cmd": "pay", "target": "npub2...", "amount": "21000" },
+    "powBits": 0,
+    "timeoutMs": 5000
+  }'
+```
+
+**Response 200**
+```json
+{
+  "id": "abcdef123456...",
   "relays": ["wss://relay.example.com"]
 }
 ```

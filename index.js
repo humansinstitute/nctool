@@ -68,12 +68,16 @@ async function tailEvents() { // Removed sessionKey as direct param, we get all 
   const es = new EventSource(`${API_BASE}/stream/events/${sessionId}`);
   es.onmessage = ev => {
     try {
-      const eventData = JSON.parse(ev.data);
-      // Optionally format the output to show who sent the event
-      const authorNpub = nip19.npubEncode(eventData.pubkey);
-      console.log(`🆕 [from: ${authorNpub}]`, eventData.content);
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'decryptedAction') {
+        const { payload, senderNpub, responseNpub } = msg.data;
+        console.log(`🆕 Decrypted payload from ${senderNpub}:`, payload);
+        console.log(`    (Respond to: ${responseNpub})`);
+      } else {
+        console.log('🆕 Raw message:', msg);
+      }
     } catch (parseError) {
-      console.log('🆕 Raw:', ev.data); // Fallback for non-JSON data
+      console.log('🆕 Raw:', ev.data);
     }
   };
   es.onerror = err => console.error('Stream error:', err);
@@ -208,10 +212,14 @@ async function main() {
           }
         });
       } else if (choice === 'd') {
+        // Encrypted action publishing via API
+        const callNpub = await prompt('Call NPub (target): ');
+        const responseNpubInput = await prompt(`Response NPub (default ${sessionKey.npub}): `);
+        const responseNpub = responseNpubInput || sessionKey.npub;
         const input = await prompt('Enter JSON payload or leave blank for default: ');
         const defaultPayload = {
           cmd: 'pay',
-          target: 'npub1jss47s4fvv6usl7tn6yp5zamv2u60923ncgfea0e6thkza5p7c3q0afmzy',
+          target: callNpub,
           amount: '21000'
         };
         let payload;
@@ -225,27 +233,17 @@ async function main() {
             continue;
           }
         }
-        const { ndk, signer, npub } = await connect(sessionKey);
         const powBits = Number(process.env.POW_BITS) || 20;
         const timeoutMs = Number(process.env.TIMEOUT_MS) || 10000;
-        const actionResp = await axios.post(`${API_BASE}/action`, {
-          dTag: 'avalon:task:10002929',
+        const actionResp = await axios.post(`${API_BASE}/action/encrypted`, {
+          senderNpub: sessionKey.npub,
+          callNpub,
+          responseNpub,
           payload,
           powBits,
           timeoutMs
         });
-        console.log('Action published:', actionResp.data);
-        const { data: pubHex } = nip19.decode(npub);
-        const filter = { authors: [pubHex], kinds: [0, 1, 30078], limit: 10 };
-        const events = await ndk.fetchEvents(filter, { timeoutSec: 5 });
-        console.log(`\n📝 Latest 10 events by ${npub} (kinds 0,1,30078):\n`);
-        [...events]
-          .sort((a, b) => b.created_at - a.created_at)
-          .forEach((e, i) => {
-            console.log(
-              `${i + 1}. [${e.kind}] ${e.content} (id: ${e.id}, created_at: ${e.created_at})`
-            );
-          });
+        console.log('Encrypted action published:', actionResp.data);
       } else if (choice === '5') {
         // No longer need to pass sessionKey, tailEvents gets all keys itself
         await tailEvents();

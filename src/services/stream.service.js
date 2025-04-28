@@ -1,5 +1,6 @@
 import { connect } from './nostr.service.js';
-import { nip19 } from 'nostr-tools';
+import { nip19, nip04 } from 'nostr-tools';
+import { getAllKeys } from './identity.service.js';
 import { randomUUID } from 'crypto';
 
 const sessions = new Map();
@@ -26,7 +27,7 @@ export async function startSession(npubs) {
         }).filter(hex => hex !== null); // Filter out any nulls from failed decodes
 
         if (authorHexKeys.length > 0) {
-            filter = { ...filter, authors: authorHexKeys };
+            filter = { kinds: [30078], '#p': authorHexKeys };
         }
     }
     // If no valid npubs are provided, the filter will just be { kinds: [30078] }
@@ -34,7 +35,7 @@ export async function startSession(npubs) {
     // Consider if a default behavior is needed when no authors are specified.
 
     const sub = ndk.subscribe(filter, { closeOnEose: false });
-    sessions.set(id, { sub, clients: [] });
+    sessions.set(id, { sub, clients: [], npubs });
     return id;
 }
 
