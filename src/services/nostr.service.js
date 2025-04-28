@@ -1,7 +1,22 @@
-import NDK, { NDKPrivateKeySigner, NDKEvent } from "@nostr-dev-kit/ndk";
+import NDK, { NDKPrivateKeySigner, NDKEvent, NDKKind } from "@nostr-dev-kit/ndk";
 import { nip19, nip04 } from "nostr-tools";
 import { getAllKeys } from "./identity.service.js";
 import { mineEventPow } from "./pow.service.js";
+
+/**
+ * Builds a basic Kind 1 Nostr text note event object.
+ * @param {string} content - text content of the note
+ * @returns {object} Nostr event object
+ */
+export function buildTextNote(content) {
+    const timestamp = Math.floor(Date.now() / 1000);
+    return {
+        kind: NDKKind.Text,
+        content,
+        tags: [],
+        created_at: timestamp
+    };
+}
 
 const DEFAULT_POW = Number(process.env.POW_BITS) || 0;
 const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 5000;

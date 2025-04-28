@@ -70,3 +70,18 @@ export function generateKeyPair(name) {
     saveAllKeys(keys);
     return keyObj;
 }
+
+/**
+ * Retrieves the private key (nsec) for a given npub.
+ * @param {string} npub
+ * @returns {string} nsec for the provided npub
+ * @throws {Error} if no key is found for the given npub
+ */
+export function getPrivateKeyByNpub(npub) {
+    const keys = getAllKeys();
+    const entry = keys.find(k => k.npub === npub);
+    if (!entry) {
+        throw new Error(`No key found for npub: ${npub}`);
+    }
+    return entry.nsec;
+}

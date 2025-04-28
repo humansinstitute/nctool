@@ -65,11 +65,12 @@ a) Update profile
 b) Create a post
 c) View last 10 posts
 d) Publish encrypted action
+f) Sign event remotely
 5) Subscribe for Data Input
 e) Exit
 ```
 
-Prompts: `Enter a, b, c, d, 5 or e:`
+Prompts: `Enter a, b, c, d, f, 5 or e:`
 
 #### Option a) Update Profile
 
@@ -163,6 +164,31 @@ Prompts: `Enter a, b, c, d, 5 or e:`
 5. Logs:
    ```
    Encrypted action published: <response data>
+   ```
+
+#### Option f) Sign event remotely
+1. Prompts:
+   - `Call NPub (target, default <sessionKey.npub>):`
+   - `Response NPub (default <sessionKey.npub>):`
+   - `Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp):`
+   - `Enter stringified Nostr event JSON`
+2. Calls:
+   ```
+   POST /post/note_remote
+   ```
+   with body:
+   ```json
+   {
+     "senderNpub": "<sessionKey.npub>",
+     "callNpub": "<callNpub>",
+     "responseNpub": "<responseNpub>",
+     "signerNpub": "<signerNpub>",
+     "eventPayload": "<eventPayload>"
+   }
+   ```
+3. Logs:
+   ```
+   Remote sign request sent: <response data>
    ```
 
 #### Option 5) Subscribe for Data Input (`tailEvents`)

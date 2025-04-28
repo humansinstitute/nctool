@@ -257,6 +257,45 @@ curl -X POST http://localhost:3000/post/note \
 }
 ```
 
+### POST /post/note_remote
+Sends a remote sign request via Nostr MQ Kind 4 encrypted DM.
+
+**Body Parameters**  
+| Name         | Type   | Required | Description                                                                                                               |
+|--------------|--------|----------|---------------------------------------------------------------------------------------------------------------------------|
+| senderNpub   | string | Yes      | `npub` of the sender initiating the sign request.                                                                         |
+| callNpub     | string | Yes      | `npub` of the remote signer (recipient of the encrypted request).                                                         |
+| responseNpub | string | Yes      | `npub` where the remote signer will send the signed event back.                                                           |
+| signerNpub   | string | Yes      | `npub` of the key that the remote signer should use to sign the event.                                                    |
+| noteContent  | string | Yes      | Text content of the note; the API constructs a standard Kind 1 event internally.                                           |
+| threadID     | string | No       | `callID` of the parent request, used for threading. If omitted, a new `threadID` is generated equal to the new `callID`. |
+| powBits      | number | No       | POW difficulty bits (default: `process.env.POW_BITS`).                                                                     |
+| timeoutMs    | number | No       | Publish timeout in ms (default: `process.env.TIMEOUT_MS`).                                                                 |
+
+**Response 200**  
+```json
+{
+  "callID": "generated-uuid-v4",
+  "id": "abcdef123456...",
+  "relays": ["wss://relay.example.com"]
+}
+```
+
+**Example**  
+```bash
+curl -X POST http://localhost:3000/post/note_remote \
+  -H "Content-Type: application/json" \
+  -d '{
+    "senderNpub": "npub1...sender",
+    "callNpub": "npub2...signer",
+    "responseNpub": "npub3...response",
+    "signerNpub": "npub4...signer",
+    "noteContent": "Hello",
+    "powBits": 20,
+    "timeoutMs": 10000
+  }'
+```
+
 ---
 
 ### GET /post/view10

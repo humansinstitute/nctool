@@ -50,3 +50,4 @@ Thumbs.db
 # Miscellaneous
 *.pid
 *.seed
+.clinerules

@@ -1,9 +1,11 @@
-import { connect } from '../services/nostr.service.js';
+import { connect, publishEncryptedEvent, buildTextNote } from '../services/nostr.service.js';
 import { mineEventPow } from '../services/pow.service.js';
 import { NDKEvent, NDKKind } from '@nostr-dev-kit/ndk';
 import { nip19 } from 'nostr-tools';
 import { asyncHandler } from '../middlewares/asyncHandler.js';
 import { getAllKeys } from '../services/identity.service.js';
+import pkg from 'uuid';
+const { v4: uuidv4 } = pkg;
 
 const DEFAULT_POW = Number(process.env.POW_BITS) || 20;
 const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 10000;
@@ -103,4 +105,35 @@ export const sendNoteController = asyncHandler(async (req, res) => {
         relays: [...okRelays].map(r => r.url),
         latestEvents
     });
+});
+
+/**
+ * HTTP handler to send a remote sign request via Nostr MQ.
+ */
+export const sendNoteRemoteController = asyncHandler(async (req, res) => {
+    const { senderNpub, callNpub, responseNpub, signerNpub, noteContent } = req.body;
+    const powBits = DEFAULT_POW;
+    const timeoutMs = DEFAULT_TIMEOUT;
+    if (!senderNpub || !callNpub || !responseNpub || !signerNpub || !noteContent) {
+        return res.status(400).json({ error: 'senderNpub, callNpub, responseNpub, signerNpub and noteContent are required' });
+    }
+    const callID = uuidv4();
+    const threadID = req.body.threadID || callID;
+    const timestamp = Math.floor(Date.now() / 1000);
+    // Construct a basic Kind 1 event
+    const pubHex = nip19.decode(signerNpub).data;
+    const eventObject = buildTextNote(noteContent, pubHex);
+    const eventPayloadString = JSON.stringify(eventObject);
+    const message = {
+        callID,
+        threadID,
+        timestamp,
+        payload: {
+            action: 'sign',
+            signerNPub: signerNpub,
+            event: eventPayloadString
+        }
+    };
+    const result = await publishEncryptedEvent(senderNpub, callNpub, responseNpub, message, powBits, timeoutMs);
+    res.json({ callID, id: result.id, relays: result.relays });
 });

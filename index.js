@@ -3,8 +3,10 @@ import axios from 'axios';
 import readline from 'readline';
 import { EventSource } from 'eventsource';
 import { connect } from './src/services/nostr.service.js';
-import { getAllKeys, generateKeyPair } from './src/services/identity.service.js';
-import { nip19 } from 'nostr-tools';
+import { getAllKeys, generateKeyPair, getPrivateKeyByNpub } from './src/services/identity.service.js';
+import { nip19, finalizeEvent } from 'nostr-tools';
+import pkg from 'uuid';
+const { v4: uuidv4 } = pkg;
 
 const API_BASE = process.env.API_URL || 'http://localhost:3000';
 
@@ -66,13 +68,55 @@ async function tailEvents() { // Removed sessionKey as direct param, we get all 
 
   // 3. open the stream
   const es = new EventSource(`${API_BASE}/stream/events/${sessionId}`);
-  es.onmessage = ev => {
+  es.onmessage = async ev => {
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'decryptedAction') {
-        const { payload, senderNpub, responseNpub } = msg.data;
-        console.log(`🆕 Decrypted payload from ${senderNpub}:`, payload);
-        console.log(`    (Respond to: ${responseNpub})`);
+        const { payload: outer, senderNpub, responseNpub } = msg.data;
+        const inner = outer.payload;
+        if (inner.action === 'sign') {
+          console.log(`🆕 Sign request from ${senderNpub}:`, inner);
+          try {
+            const nsec = getPrivateKeyByNpub(inner.signerNPub);
+            const { data: privKeyHex } = nip19.decode(nsec);
+            const unsignedEvent = JSON.parse(inner.event);
+            const signedEvent = finalizeEvent(unsignedEvent, privKeyHex);
+            const newCallID = uuidv4();
+            const timestamp = Math.floor(Date.now() / 1000);
+            const nostrMqResponse = {
+              callID: newCallID,
+              threadID: outer.threadID,
+              timestamp,
+              payload: {
+                action: 'signed',
+                signerNPub: inner.signerNPub,
+                signedEvent: JSON.stringify(signedEvent)
+              }
+            };
+            await axios.post(`${API_BASE}/action/encrypted`, {
+              senderNpub: inner.signerNPub,
+              callNpub: responseNpub,
+              responseNpub: inner.signerNPub,
+              payload: nostrMqResponse,
+              powBits: Number(process.env.POW_BITS) || 20,
+              timeoutMs: Number(process.env.TIMEOUT_MS) || 10000
+            });
+            console.log('Signed event sent back to', responseNpub);
+          } catch (signErr) {
+            console.error('Error signing event:', signErr.message);
+          }
+        } else if (inner.action === 'signed') {
+          console.log(`🆕 Signed event received from ${senderNpub}:`, inner);
+          try {
+            const eventToBroadcast = JSON.parse(inner.signedEvent);
+            await axios.post(`${API_BASE}/post/broadcast`, { event: eventToBroadcast });
+            console.log('Broadcasted signed event');
+          } catch (broadcastErr) {
+            console.error('Error broadcasting signed event:', broadcastErr.message);
+          }
+        } else {
+          console.log(`🆕 Decrypted payload from ${senderNpub}:`, inner);
+        }
       } else {
         console.log('🆕 Raw message:', msg);
       }
@@ -154,6 +198,7 @@ async function main() {
     console.log('c) View last 10 posts');
     console.log('d) Publish action');
     console.log('5) Subscribe for Data Input');
+    console.log('f) Sign event remotely');
     console.log('e) Exit');
 
     const choice = await prompt('Enter a, b, c, d, 5 or e: ');
@@ -244,6 +289,25 @@ async function main() {
           timeoutMs
         });
         console.log('Encrypted action published:', actionResp.data);
+      } else if (choice === 'f') {
+        // Remote sign request via API
+        const callNpubInput = await prompt(`Call NPub (target, default ${sessionKey.npub}): `);
+        const callNpub = callNpubInput || sessionKey.npub;
+        const responseNpubInput = await prompt(`Response NPub (default ${sessionKey.npub}): `);
+        const responseNpub = responseNpubInput || sessionKey.npub;
+        const signerNpubInput = await prompt('Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp): ');
+        const signerNpub = signerNpubInput || 'npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp';
+        const noteContent = await prompt('Enter note content: ');
+        try {
+          const remoteResp = await axios.post(`${API_BASE}/post/note_remote`, { senderNpub: sessionKey.npub, callNpub, responseNpub, signerNpub, noteContent });
+          console.log('Remote sign request sent:', remoteResp.data);
+        } catch (err) {
+          if (err.response) {
+            console.error('API error:', err.response.data);
+          } else {
+            console.error('Error:', err.message);
+          }
+        }
       } else if (choice === '5') {
         // No longer need to pass sessionKey, tailEvents gets all keys itself
         await tailEvents();
