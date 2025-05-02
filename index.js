@@ -211,9 +211,10 @@ async function main() {
     console.log('d) Publish action');
     console.log('5) Subscribe for Data Input');
     console.log('f) Sign event remotely');
+    console.log('g) Create eCash wallet');
     console.log('e) Exit');
 
-    const choice = await prompt('Enter a, b, c, d, 5 or e: ');
+    const choice = await prompt('Enter a, b, c, d, 5, f, g or e: ');
 
     try {
       if (choice === 'a') {
@@ -320,15 +321,35 @@ async function main() {
           });
           console.log('Remote sign request sent:', remoteResp.data);
         } catch (err) {
-          if (err.response) {
-            console.error('API error:', err.response.data);
-          } else {
-            console.error('Error:', err.message);
-          }
+          console.error(
+            'Error creating eCash wallet:',
+            err.response
+              ? JSON.stringify(err.response.data, null, 2)
+              : err.message || err
+          );
         }
       } else if (choice === '5') {
         // Subscribe only to events for this user's npub
         await tailEvents(sessionKey.npub);
+        continue;
+      } else if (choice === 'g') {
+        try {
+          const { data } = await axios.post(`${API_BASE}/wallet/create`, { npub: sessionKey.npub });
+          if (data.message === 'Wallet already exists') {
+            console.log('\nWallet already exists:');
+            console.log(`Mint: ${data.walletDetails.mint}`);
+            console.log(`Public Key for receiving: ${data.walletDetails.p2pkPub}`);
+          } else {
+            console.log('\nWallet created successfully:');
+            console.log(`Mint: ${data.walletDetails.mint}`);
+            console.log(`Public Key for receiving: ${data.walletDetails.p2pkPub}`);
+          }
+        } catch (err) {
+          const errorMsg = err.response && err.response.data
+            ? (err.response.data.message || JSON.stringify(err.response.data))
+            : (err.message || String(err));
+          console.error('Error creating eCash wallet:', errorMsg);
+        }
         continue;
       } else if (choice === 'e') {
         console.log('Exiting.');

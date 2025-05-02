@@ -237,8 +237,10 @@ Because **all state lives on Nostr (encrypted)**, the backend can be restarted o
 
 ### Next steps / improvements (once you’re comfortable)
 
+* **Lightning–internal exchange** – use the mint’s built-in LN gateway to allow “withdraw to invoice” via `/wallet/spend`.
+* **Lightning–Address Support** – use the mint’s built-in LN gateway to allow “withdraw to invoice” via `/wallet/spend`.
 * **Multi-mint support** – extend the wallet meta event to track multiple mints.  
 * **Web-socket sub (push)** – instead of polling `/wallet/receive`, open a background WS to relays and auto-trigger redemption.  
-* **Lightning–internal exchange** – use the mint’s built-in LN gateway to allow “withdraw to invoice” via `/wallet/spend`.
+
 
 With this stripped-down approach, each endpoint is a single, testable unit—and the CLI stays tiny while still exercising the full Nutstash / Nutzap flow.
