@@ -18,7 +18,7 @@ export const startStream = asyncHandler(async (req, res) => {
     res.json({ sessionId });
 });
 
-export const streamEvents = (req, res) => {
+export const streamEvents = async (req, res) => {
     const { id } = req.params;
     const session = getSession(id);
     if (!session) {
@@ -31,7 +31,7 @@ export const streamEvents = (req, res) => {
     }).flushHeaders();
 
     const { sub, clients, npubs } = session;
-    const keys = getAllKeys();
+    const keys = await getAllKeys();
 
     const push = async (ev) => {
         try {

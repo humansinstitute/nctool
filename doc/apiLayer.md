@@ -19,7 +19,7 @@ http://localhost:3000
 ## Identity
 
 ### POST /id/generateKey
-Generates and persists a new Nostr keypair to `~/.nctool/keys.json`.
+Generates and persists a new Nostr keypair to `~/.nctool/keys.json` and logs the created identity object to the server console.
 
 **Request**  
 - No parameters or body

@@ -172,7 +172,8 @@ Prompts: `Enter a, b, c, d, f, 5 or e:`
    - `Call NPub (target, default npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5):`
    - `Response NPub (default <sessionKey.npub>):`
    - `Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp):`
-   - `Enter stringified Nostr event JSON`
+   - `Enter note content`
+- `Client 2 signs the note using the private key corresponding to the specified signerNpub`
 2. Calls:
    ```
    POST /post/note_remote
@@ -184,7 +185,7 @@ Prompts: `Enter a, b, c, d, f, 5 or e:`
      "callNpub": "<callNpub>",
      "responseNpub": "<responseNpub>",
      "signerNpub": "<signerNpub>",
-     "eventPayload": "<eventPayload>"
+     "noteContent": "<noteContent>"
    }
    ```
 3. Logs:

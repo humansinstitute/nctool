@@ -6,13 +6,22 @@ import { EventSource } from 'eventsource';
 import { connect } from './src/services/nostr.service.js';
 import { getAllKeys, generateKeyPair, getPrivateKeyByNpub } from './src/services/identity.service.js';
 import { nip19, finalizeEvent } from 'nostr-tools';
+import connectDB from './src/config/db.js';
 import { buildTextNote } from './src/services/nostr.service.js';
 import { mineEventPow } from './src/services/pow.service.js';
 import pkg from 'uuid';
+import logUpdate from 'log-update';
 const { v4: uuidv4 } = pkg;
 
 const API_BASE = process.env.API_URL || 'http://localhost:3000';
 const IGNORE_OLD_MS = Number(process.env.IGNORE_OLD) || Infinity;
+
+// Buffer and renderer for streaming messages
+let logBuffer = [];
+function output(line) {
+  logBuffer.push(line);
+  logUpdate(logBuffer.join('\n'));
+}
 
 function prompt(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -25,261 +34,143 @@ function prompt(question) {
 }
 
 async function chooseKey() {
-  const keys = getAllKeys();
+  const keys = await getAllKeys();
   if (keys.length) {
     console.log('\nSelect a user:');
-    keys.forEach((k, i) => {
-      console.log(`${i + 1}) ${k.name}`);
-    });
+    keys.forEach((k, i) => console.log(`${i + 1}) ${k.name}`));
     console.log('n) Create new user');
     const choice = await prompt('Enter number or n: ');
     if (choice.toLowerCase() === 'n') {
       const name = await prompt('Enter a name for the new user: ');
-      return generateKeyPair(name);
+      return generateKeyPair(name, '61487097701@c.us');
     }
     const idx = parseInt(choice, 10) - 1;
-    if (idx >= 0 && idx < keys.length) {
-      return keys[idx];
-    }
+    if (idx >= 0 && idx < keys.length) return keys[idx];
     console.log('Invalid selection, try again.');
     return chooseKey();
-  } else {
-    console.log('\nNo users found. Creating a new user.');
-    const name = await prompt('Enter a name for the new user: ');
-    return generateKeyPair(name);
   }
+  console.log('\nNo users found. Creating a new user.');
+  const name = await prompt('Enter a name for the new user: ');
+  return generateKeyPair(name, '61487097701@c.us');
 }
 
-async function tailEvents(targetNpub) { // Removed sessionKey as direct param, we get all keys now
-  // 1. Get all known npubs
-  const npubs = [targetNpub];
-
-  // 2. tell API to spin up (or reuse) the SSE session, providing all npubs
+async function tailEvents(sessionKey) {
+  const targetNpub = sessionKey.npub;
+  logBuffer = [];
   let sessionId;
   try {
-    // Send the array of all npubs to the backend
-    const resp = await axios.post(`${API_BASE}/stream/start`, {
-      npubs
-    });
+    const resp = await axios.post(`${API_BASE}/stream/start`, { npubs: [targetNpub] });
     sessionId = resp.data.sessionId;
   } catch (err) {
-    console.error('Failed to start stream:', err.message);
+    output(`Stream start error: ${err.message}`);
     return;
   }
-
-  console.log(`\n🕑 Waiting for data from author: ${targetNpub} – press Q to quit\n`);
-
-  // 3. open the stream
+  output(`🕑 Subscribed for ${targetNpub} – press Ctrl+C to stop`);
   const es = new EventSource(`${API_BASE}/stream/events/${sessionId}`);
   es.onmessage = async ev => {
+    let line;
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'decryptedAction') {
-        const { payload: outer, senderNpub, responseNpub, timestamp } = msg.data;
-        if (timestamp === undefined) {
-          console.log('Message is ignored - no timestamp');
-          return;
-        }
-        const ageMs = Date.now() - timestamp * 1000;
-        if (ageMs > IGNORE_OLD_MS) {
-          console.log('Message not signed as it is out of date');
-          return;
-        }
-        const inner = outer.payload;
-        if (inner.action === 'sign') {
-          console.log(`🆕 Sign request from ${senderNpub}:`, inner);
-          try {
-            const nsec = getPrivateKeyByNpub(inner.signerNPub);
-            const { data: privKeyHex } = nip19.decode(nsec);
-            const unsignedEvent = JSON.parse(inner.event);
-            const signedEvent = finalizeEvent(unsignedEvent, privKeyHex);
-            const newCallID = uuidv4();
-            const timestamp = Math.floor(Date.now() / 1000);
-            const nostrMqResponse = {
-              callID: newCallID,
-              threadID: outer.threadID,
-              timestamp,
-              payload: {
-                action: 'signed',
-                signerNPub: inner.signerNPub,
-                signedEvent: JSON.stringify(signedEvent)
-              }
-            };
-            await axios.post(`${API_BASE}/action/encrypted`, {
-              senderNpub: inner.signerNPub,
-              callNpub: responseNpub,
-              responseNpub: inner.signerNPub,
-              payload: nostrMqResponse,
-              powBits: Number(process.env.POW_BITS) || 20,
-              timeoutMs: Number(process.env.TIMEOUT_MS) || 10000
-            });
-            console.log('Signed event sent back to', responseNpub);
-          } catch (signErr) {
-            console.error('Error signing event:', signErr.message);
-          }
-        } else if (inner.action === 'signed') {
-          console.log(`🆕 Signed event received from ${senderNpub}:`, inner);
-          try {
-            const eventToBroadcast = JSON.parse(inner.signedEvent);
-            await axios.post(`${API_BASE}/post/broadcast`, { event: eventToBroadcast });
-            console.log('Broadcasted signed event');
-          } catch (broadcastErr) {
-            console.error('Error broadcasting signed event:', broadcastErr.message);
-          }
+        const { payload: out, senderNpub, responseNpub, timestamp, threadID } = msg.data;
+        const age = Date.now() - timestamp * 1000;
+        if (!timestamp || age > IGNORE_OLD_MS) {
+          line = `Ignored old or malformed message from ${senderNpub}`;
         } else {
-          console.log(`🆕 Decrypted payload from ${senderNpub}:`, inner);
+          const inner = out.payload;
+          if (inner.action === 'sign') {
+            try {
+              const nsec = await getPrivateKeyByNpub(inner.signerNPub);
+              const { data: privKeyHex } = nip19.decode(nsec);
+              const unsignedEvent = JSON.parse(inner.event);
+              const signedEvent = finalizeEvent(unsignedEvent, privKeyHex);
+              const newCallID = uuidv4();
+              const timestamp2 = Math.floor(Date.now() / 1000);
+              const nostrMqResponse = {
+                callID: newCallID,
+                threadID: threadID,
+                timestamp: timestamp2,
+                payload: {
+                  action: 'signed',
+                  signerNPub: inner.signerNPub,
+                  signedEvent: JSON.stringify(signedEvent)
+                }
+              };
+              await axios.post(`${API_BASE}/action/encrypted`, {
+                senderNpub: inner.signerNPub,
+                callNpub: responseNpub,
+                responseNpub: inner.signerNPub,
+                payload: nostrMqResponse,
+                powBits: Number(process.env.POW_BITS) || 20,
+                timeoutMs: Number(process.env.TIMEOUT_MS) || 10000
+              });
+              line = `✅ Signed event sent back to ${responseNpub}`;
+            } catch (signErr) {
+              line = `❌ Error signing event: ${signErr.message}`;
+              console.error("Error details:", signErr.response?.data || signErr);
+            }
+          } else if (inner.action === 'signed') {
+            try {
+              const eventToBroadcast = JSON.parse(inner.signedEvent);
+              await axios.post(`${API_BASE}/post/broadcast`, { event: eventToBroadcast });
+              line = `✅ Broadcasted signed event: ${eventToBroadcast.id}`;
+            } catch (broadcastErr) {
+              line = `❌ Error broadcasting signed event: ${broadcastErr.message}`;
+              console.error("Broadcast error details:", broadcastErr.response?.data || broadcastErr);
+            }
+          } else {
+            line = `🆕 Payload from ${senderNpub}: ${JSON.stringify(inner)}`;
+          }
         }
       } else {
-        console.log('🆕 Raw message:', msg);
+        line = `🆕 Raw: ${JSON.stringify(msg)}`;
       }
-    } catch (parseError) {
-      console.log('🆕 Raw:', ev.data);
+    } catch {
+      line = `🆕 Raw data: ${ev.data}`;
     }
+    output(line);
   };
-  es.onerror = err => console.error('Stream error:', err);
-
-  // 4. capture a single keypress
-  readline.emitKeypressEvents(process.stdin);
-  if (process.stdin.isTTY) process.stdin.setRawMode(true);
-  process.stdin.resume(); // Resume stdin so keypress events are emitted
-
-  await new Promise((resolve, reject) => { // Added reject for potential errors
-    const cleanupAndExit = (exitCode = 0, message = '\n⏹  Subscription stopped.\n') => {
-      try {
-        es.close(); // Close EventSource connection
-        axios.delete(`${API_BASE}/stream/stop/${sessionId}`).catch(err => console.error("Error stopping backend stream:", err.message)); // Tell backend to stop
-        if (process.stdin.isTTY) {
-          process.stdin.setRawMode(false); // Turn off raw mode IMPORTANT: Check if TTY first
-          process.stdin.pause(); // Pause stdin to restore normal mode
-        }
-        process.stdin.off('keypress', onKey); // Remove the listener
-        console.log(message);
-        if (exitCode !== null) { // Allow resolving without exiting if needed
-          process.exit(exitCode); // Exit the process for Ctrl+C
-        } else {
-          resolve(); // Resolve promise for 'q'
-        }
-      } catch (cleanupError) {
-        console.error("Error during cleanup:", cleanupError);
-        process.exit(1); // Exit with error if cleanup fails
-      }
-    };
-
-    const onKey = (_, key) => {
-      // Handle 'q' or 'Q'
-      if (key && (key.name === 'q' || key.name === 'Q')) {
-        cleanupAndExit(null); // Resolve promise, don't force exit code
-      }
-      // Handle Ctrl+C
-      else if (key && key.ctrl && key.name === 'c') {
-        cleanupAndExit(0, '\n⏹  Subscription stopped (Ctrl+C).\n'); // Exit with code 0
-      }
-      // Handle Ctrl+D (often EOF)
-      else if (key && key.ctrl && key.name === 'd') {
-        cleanupAndExit(0, '\n⏹  Subscription stopped (Ctrl+D).\n'); // Exit with code 0
-      }
-    };
-
-    process.stdin.on('keypress', onKey);
-
-    // Also handle potential errors on stdin
-    process.stdin.on('error', (err) => {
-      console.error("Stdin error:", err);
-      cleanupAndExit(1, '\n⏹  Subscription stopped due to input error.\n');
-    });
-
-    // Handle case where stdin closes unexpectedly
-    process.stdin.on('close', () => {
-      // Check if EventSource is still open before trying to close
-      if (es && es.readyState !== EventSource.CLOSED) {
-        cleanupAndExit(0, '\n⏹  Subscription stopped (input closed).\n');
-      } else {
-        resolve(); // Already closing/closed
-      }
-    });
-  });
+  es.onerror = err => output(`Stream error: ${err.message}`);
 }
 
 async function main() {
+  await connectDB();
   const sessionKey = await chooseKey();
+  tailEvents(sessionKey);
 
   while (true) {
-    console.log(`\nHello ${sessionKey.name}, what would you like to do?`);
+    console.log(`\nHello ${sessionKey.name}, choose:`);
     console.log('a) Update profile');
-    console.log('b) Create a post');
+    console.log('b) Create post');
     console.log('c) View last 10 posts');
     console.log('d) Publish action');
-    console.log('5) Subscribe for Data Input');
-    console.log('f) Sign event remotely');
+    console.log('f) Sign remotely');
     console.log('g) Create eCash wallet');
     console.log('e) Exit');
-
-    const choice = await prompt('Enter a, b, c, d, 5, f, g or e: ');
+    const choice = await prompt('Enter a, b, c, d, f, g or e: ');
 
     try {
       if (choice === 'a') {
         const name = await prompt('Name: ');
         const about = await prompt('About: ');
-        const picture = await prompt('Picture URL (optional): ');
-        const body = { name, about };
-        if (picture) body.picture = picture;
-        const resp = await axios.post(`${API_BASE}/profile/update`, { ...body, npub: sessionKey.npub });
-        console.log('Updated profile:', resp.data);
-        const viewResp = await axios.get(`${API_BASE}/post/view10`, { params: { npub: sessionKey.npub } });
-        console.log('\nLatest 10 events:');
-        viewResp.data.forEach((p, i) => {
-          console.log(`${i + 1}. [${p.kind}] ${p.content} (id: ${p.id}, created_at: ${p.created_at})`);
-        });
+        const picture = await prompt('Picture (url): ');
+        const resp = await axios.post(`${API_BASE}/profile/update`, { name, about, picture, npub: sessionKey.npub });
+        console.log('Profile updated:', resp.data);
       } else if (choice === 'b') {
-        const content = await prompt('Post content: ');
-        const { ndk, signer, npub } = await connect(sessionKey);
-        const powBits = Number(process.env.POW_BITS) || 20;
-        const timeoutMs = Number(process.env.TIMEOUT_MS) || 10000;
-        const resp = await axios.post(`${API_BASE}/post/note`, {
-          npub,
-          content,
-          powBits,
-          timeoutMs
-        });
-        console.log('Created note:', resp.data);
-        const viewResp = await axios.get(`${API_BASE}/post/view10`, { params: { npub: sessionKey.npub } });
-        console.log('\nLatest 10 events:');
-        viewResp.data.forEach((p, i) => {
-          console.log(`${i + 1}. [${p.kind}] ${p.content} (id: ${p.id}, created_at: ${p.created_at})`);
-        });
+        const content = await prompt('Content: ');
+        const { npub } = await connect(sessionKey);
+        const resp = await axios.post(`${API_BASE}/post/note`, { npub, content });
+        console.log('Note created:', resp.data);
       } else if (choice === 'c') {
-        const kindInput = await prompt('Kind filter (default 1): ');
-        let kind = 1;
-        if (kindInput !== '') {
-          const parsedKind = parseInt(kindInput, 10);
-          if (!isNaN(parsedKind)) {
-            kind = parsedKind;
-          }
-        }
-        const resp = await axios.get(`${API_BASE}/post/view10`, { params: { kind, npub: sessionKey.npub } });
-        console.log(`\nLatest 10 posts (kind=${kind}):`);
-        resp.data.forEach(async (p, i) => {
-          console.log(`${i + 1}. [${p.created_at}] ${p.content} (id: ${p.id})`);
-          if (p.kind === 30078) {
-            try {
-              const payload = JSON.parse(p.content);
-              await axios.post(`${API_BASE}/action/take`, payload);
-            } catch (err) {
-              console.error('Action endpoint error:', err.message);
-            }
-          }
-        });
+        const resp = await axios.get(`${API_BASE}/post/view10`, { params: { npub: sessionKey.npub } });
+        resp.data.forEach((p, i) => console.log(`${i + 1}. ${p.content}`));
       } else if (choice === 'd') {
         // Encrypted action publishing via API
         const callNpub = await prompt('Call NPub (target): ');
         const responseNpubInput = await prompt(`Response NPub (default ${sessionKey.npub}): `);
         const responseNpub = responseNpubInput || sessionKey.npub;
         const input = await prompt('Enter JSON payload or leave blank for default: ');
-        const defaultPayload = {
-          cmd: 'pay',
-          target: callNpub,
-          amount: '21000'
-        };
+        const defaultPayload = { cmd: 'pay', target: callNpub, amount: '21000' };
         let payload;
         if (!input) {
           payload = defaultPayload;
@@ -328,10 +219,6 @@ async function main() {
               : err.message || err
           );
         }
-      } else if (choice === '5') {
-        // Subscribe only to events for this user's npub
-        await tailEvents(sessionKey.npub);
-        continue;
       } else if (choice === 'g') {
         try {
           const { data } = await axios.post(`${API_BASE}/wallet/create`, { npub: sessionKey.npub });
@@ -355,14 +242,10 @@ async function main() {
         console.log('Exiting.');
         process.exit(0);
       } else {
-        console.log('Invalid selection.');
+        console.log('Invalid choice.');
       }
     } catch (err) {
-      if (err.response) {
-        console.error('API error:', err.response.data);
-      } else {
-        console.error('Error:', err.message);
-      }
+      console.error('Error:', err.message || err);
     }
   }
 }

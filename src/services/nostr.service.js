@@ -28,7 +28,7 @@ const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 5000;
  */
 export async function connect(keyObj) {
     if (!keyObj) {
-        const all = getAllKeys();
+        const all = await getAllKeys();
         if (!all.length) {
             throw new Error("No keys available; generate keys first");
         }
@@ -78,7 +78,7 @@ export async function publishEncryptedEvent(
     timeoutMs = DEFAULT_TIMEOUT
 ) {
     // Find the sender's key object
-    const keys = getAllKeys();
+    const keys = await getAllKeys();
     const senderKeyObj = keys.find(k => k.npub === senderNpub);
     if (!senderKeyObj) {
         throw new Error(`Unknown sender npub: ${senderNpub}`);

@@ -67,10 +67,14 @@ export const viewPosts = asyncHandler(async (req, res) => {
  */
 export const sendNoteController = asyncHandler(async (req, res) => {
     const { npub, powBits = DEFAULT_POW, timeoutMs = DEFAULT_TIMEOUT, content } = req.body;
+    console.log(`DEBUG sendNoteController: received npub=${npub}, content length=${content?.length}`);
     if (!npub || !content) {
+        console.log('DEBUG sendNoteController: missing npub or content');
         return res.status(400).json({ error: 'npub and content are required' });
     }
-    const keys = getAllKeys();
+    const keys = await getAllKeys();
+    console.log(`DEBUG sendNoteController: getAllKeys returned ${keys.length} entries`);
+    console.log('DEBUG sendNoteController: available npubs:', keys.map(k => k.npub));
     const keyObj = keys.find(k => k.npub === npub);
     if (!keyObj) throw new Error("Unknown npub for note");
     const { ndk } = await connect(keyObj);

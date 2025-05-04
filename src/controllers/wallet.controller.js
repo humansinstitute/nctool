@@ -2,7 +2,7 @@ import { nip04, nip19 } from 'nostr-tools';
 import { NDKEvent } from '@nostr-dev-kit/ndk';
 import { asyncHandler } from '../middlewares/asyncHandler.js';
 import { connect } from '../services/nostr.service.js';
-import { getAllKeys, saveAllKeys } from '../services/identity.service.js';
+import { getAllKeys, updateWalletInfo } from '../services/identity.service.js';
 import { generateP2PKKeypair, checkWalletExists, getWalletDetails } from '../services/cashu.service.js';
 
 const MINT_URL = process.env.MINT_URL || 'https://mint.minibits.cash/Bitcoin';
@@ -20,7 +20,7 @@ export const create = asyncHandler(async (req, res) => {
     }
 
     // Look up user's key object
-    const keys = getAllKeys();
+    const keys = await getAllKeys();
     const keyObj = keys.find(k => k.npub === npub);
     if (!keyObj) {
         return res.status(404).json({ error: 'User not found' });
@@ -75,7 +75,7 @@ export const create = asyncHandler(async (req, res) => {
 
     // Store wallet info in keys.json
     keyObj.wallet = { mint: MINT_URL, p2pkPub };
-    saveAllKeys(keys);
+    await updateWalletInfo(npub, { mint: MINT_URL, p2pkPub });
 
     // Return success with details and event IDs
     res.json({

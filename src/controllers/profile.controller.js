@@ -11,7 +11,7 @@ export async function updateProfile(req, res) {
     const powBits = DEFAULT_POW;
     const timeout = DEFAULT_TIMEOUT;
 
-    const keys = getAllKeys();
+    const keys = await getAllKeys();
     const keyObj = keys.find(k => k.npub === npub);
     if (!keyObj) {
         throw new Error("Unknown npub for profile update");
