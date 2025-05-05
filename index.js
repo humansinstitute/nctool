@@ -195,12 +195,12 @@ async function main() {
         console.log('Encrypted action published:', actionResp.data);
       } else if (choice === 'f') {
         // Remote sign request via API
-        const callNpubInput = await prompt('Call NPub (target, default npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5): ');
-        const callNpub = callNpubInput || 'npub1z54lfwx2v7vek7z79mkurm8nyrgjpmeanngx9m2fnc7qf53kv3sqjw8ex5';
+        const callNpubInput = await prompt('Call NPub (target, default npub17nqywpr8hvssklds0hd7uml8ydkw5vy2fj4dt6x93snh5tt9wl0sy56jrh): ');
+        const callNpub = callNpubInput || 'npub17nqywpr8hvssklds0hd7uml8ydkw5vy2fj4dt6x93snh5tt9wl0sy56jrh';
         const responseNpubInput = await prompt(`Response NPub (default ${sessionKey.npub}): `);
         const responseNpub = responseNpubInput || sessionKey.npub;
-        const signerNpubInput = await prompt('Signer NPub (default npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp): ');
-        const signerNpub = signerNpubInput || 'npub1py2a9kmpqjj45wapuw4gpwjjkt83ymr05grjh0xuwkgdtyrjzxdq8lpcdp';
+        const signerNpubInput = await prompt(`Signer NPub (default ${sessionKey.npub}): `);
+        const signerNpub = signerNpubInput || sessionKey.npub;
         const noteContent = await prompt('Enter note content: ');
         try {
           const remoteResp = await axios.post(`${API_BASE}/post/note_remote`, {
