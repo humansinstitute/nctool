@@ -52,5 +52,11 @@ export async function getIdentityByGateId(req, res) {
             message: `Identity not found for wa_gate_id ${wa_gate_id}`
         });
     }
-    res.json(identity);
+    const publicIdentity = {
+        pubkey: identity.pubkey,
+        npub: identity.npub,
+        name: identity.name,
+        wa_gate_id: identity.wa_gate_id
+    };
+    res.json(publicIdentity);
 }
