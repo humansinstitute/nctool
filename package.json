@@ -16,6 +16,7 @@
     "@cashu/cashu-ts": "^2.4.2",
     "@nostr-dev-kit/ndk": "^2.13.3",
     "axios": "^1.9.0",
+    "dotenv": "^16.5.0",
     "eventsource": "^3.0.6",
     "express": "^5.1.0",
     "log-update": "^6.1.0",

@@ -44,6 +44,9 @@ Follow the on-screen prompts to select an identity, update your profile, post no
 - `POW_BITS`: Default proof-of-work difficulty (default: `20`)  
 - `TIMEOUT_MS`: Default timeout for publishing events in milliseconds (default: `10000`)  
 - `IGNORE_OLD`: Milliseconds threshold for ignoring old messages (default: no limit)  
+- `NOSTR_RELAY_MODE`: Specifies the mode for Nostr relay connections. Can be `local` or `remote`. (default: `local`)
+- `NOSTR_LOCAL_RELAYS`: Comma-separated string of local Nostr relay URLs to use when `NOSTR_RELAY_MODE` is `local`. (default: `ws://127.0.0.1:8021`)
+- `NOSTR_REMOTE_RELAYS`: Comma-separated string of remote Nostr relay URLs to use when `NOSTR_RELAY_MODE` is `remote`. (default: `"wss://nostr.wine,wss://relayable.org,wss://relay.primal.net,wss://nostr.bitcoiner.social,wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social,wss://purplepag.es,wss://relay.nostr.band"`)
 
 ## Documentation
 

@@ -3,6 +3,31 @@ import { nip19, nip04 } from "nostr-tools";
 import { getAllKeys } from "./identity.service.js";
 import { mineEventPow } from "./pow.service.js";
 
+// Read and parse relay configurations from environment variables
+const nostrRelayMode = process.env.NOSTR_RELAY_MODE || 'local'; // Default to 'local'
+
+// Define default relay lists in case .env variables are not set
+const defaultLocalRelaysString = "ws://127.0.0.1:8021";
+const defaultRemoteRelaysString = [
+    "wss://nostr.wine", "wss://relayable.org", "wss://relay.primal.net",
+    "wss://nostr.bitcoiner.social", "wss://relay.damus.io", "wss://nos.lol",
+    "wss://relay.snort.social", "wss://purplepag.es", "wss://relay.nostr.band"
+].join(',');
+
+const localRelaysEnv = process.env.NOSTR_LOCAL_RELAYS || defaultLocalRelaysString;
+const remoteRelaysEnv = process.env.NOSTR_REMOTE_RELAYS || defaultRemoteRelaysString;
+
+// Helper function to parse comma-separated strings into an array of URLs
+const parseRelayUrls = (urlsString) => {
+    if (!urlsString) return [];
+    return urlsString.split(',')
+        .map(url => url.trim())
+        .filter(url => url); // Remove any empty strings
+}
+
+const localRelayUrls = parseRelayUrls(localRelaysEnv);
+const remoteRelayUrls = parseRelayUrls(remoteRelaysEnv);
+
 /**
  * Builds a basic Kind 1 Nostr text note event object.
  * @param {string} content - text content of the note
@@ -38,33 +63,46 @@ export async function connect(keyObj) {
     const { data: privhex } = nip19.decode(nsec);
     const signer = new NDKPrivateKeySigner(privhex);
 
+    let selectedRelays;
+    if (nostrRelayMode === 'remote') {
+        selectedRelays = remoteRelayUrls;
+        console.log("Nostr Service: Using REMOTE relays:", selectedRelays);
+    } else { // Default to local if mode is not 'remote' or is explicitly 'local'
+        selectedRelays = localRelayUrls;
+        console.log("Nostr Service: Using LOCAL relays:", selectedRelays);
+    }
+
+    if (!selectedRelays || selectedRelays.length === 0) {
+        console.warn(`Warning: No relays configured for mode '${nostrRelayMode}'. Please check your .env settings (NOSTR_LOCAL_RELAYS, NOSTR_REMOTE_RELAYS).`);
+        // Fallback to a minimal default or throw an error if no relays are absolutely critical
+        selectedRelays = [];
+    }
+
     const ndk = new NDK({
-        explicitRelayUrls: [
-            "wss://nostr.wine",
-            "wss://relayable.org",
-            "wss://relay.primal.net",
-            "wss://nostr.bitcoiner.social",
-            "wss://relay.damus.io",
-            "wss://nos.lol",
-            "wss://relay.snort.social",
-            "wss://purplepag.es",
-            "wss://relay.nostr.band"
-        ],
-        initialValidationRatio: 0.2
+        explicitRelayUrls: selectedRelays,
+        initialValidationRatio: 0.2 // Or your preferred setting
     });
     ndk.signer = signer;
-    await ndk.connect();
-    await new Promise((resolve) => {
-        const onReady = () => {
-            ndk.pool.off("relay:ready", onReady);
-            resolve();
-        };
-        ndk.pool.on("relay:ready", onReady);
-    });
+
+    console.log(`Nostr Service: Attempting to connect to ${selectedRelays.length} relays...`);
+    try {
+        await ndk.connect(DEFAULT_TIMEOUT); // Using DEFAULT_TIMEOUT
+
+        const connectedRelays = Array.from(ndk.pool.relays.values()).filter(r => r.status === r.constructor.OPEN);
+        if (connectedRelays.length > 0) {
+            console.log(`Nostr Service: Successfully connected to ${connectedRelays.length} relay(s):`, connectedRelays.map(r => r.url));
+        } else {
+            console.warn("Nostr Service: Failed to connect to any relays. Check relay URLs, network connectivity, and .env settings.");
+        }
+    } catch (error) {
+        console.error("Nostr Service: Error during NDK connect:", error);
+        throw new Error(`Failed to connect to Nostr relays: ${error.message}`);
+    }
+
     ndk.on("publish:result", ({ relay, ok, reason }) =>
-        console.log(relay.url, ok ? "OK" : `failed: ${reason}`)
+        console.log(`Nostr Service: Publish to ${relay.url} ${ok ? "OK" : `failed: ${reason}`}`)
     );
-    console.log("✅ NDK connected");
+    console.log("✅ NDK instance configured and signer set.");
 
     return { ndk, signer, npub };
 }
@@ -106,14 +144,15 @@ export async function publishEncryptedEvent(
     const event = new NDKEvent(ndk, { kind: 30078, tags, content });
     await event.sign(signer);
     // Apply proof-of-work if required
-    const rawEvent = powBits > 0
+    const shouldApplyPow = powBits > 0 && nostrRelayMode !== 'local';
+    const rawEvent = shouldApplyPow
         ? await mineEventPow(event, powBits)
         : event.rawEvent();
-    const finalEvent = powBits > 0
+    const finalEvent = shouldApplyPow
         ? new NDKEvent(ndk, rawEvent)
         : event;
-    if (powBits > 0) {
-        await finalEvent.sign(signer);
+    if (shouldApplyPow) {
+        await finalEvent.sign(signer); // Re-sign if POW was applied and event changed
     }
     // Publish and return result
     const okRelays = await finalEvent.publish(undefined, timeoutMs);
