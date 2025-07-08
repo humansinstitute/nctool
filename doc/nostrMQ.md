@@ -73,8 +73,9 @@ This document describes how Nostr’s decentralized relay network can be leverag
   - Controller `publishEncryptedActionController` handles:
     - validating `senderNpub`, `callNpub`, `responseNpub`, `payload`  
     - calling service `publishEncryptedEvent()` to encrypt, tag, and publish via NDK.  
+    - Proof of Work (PoW) for event publishing is conditional: It is skipped if the `NOSTR_RELAY_MODE` environment variable is set to `local`, even if `POW_BITS` is configured. For `remote` mode, PoW is applied if `POW_BITS` is greater than 0.
 - **Receiving (Stream):** SSE endpoints `/stream/start` and `/stream/events/:id`  
-  - `startSession(npubs)` subscribes with a `#p` tag filter for those NPub recipients.  
+  - `startSession(npubs)` subscribes with a `#p` tag filter for those NPub recipients.
   - `streamEvents` decrypts each event server-side and pushes SSE messages of type `decryptedAction` with clear payloads.  
 - **Identity:** `identity.service.js` manages key storage (`nsec`/`npub`) for encryption and decryption.
 

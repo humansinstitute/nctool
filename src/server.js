@@ -1,3 +1,6 @@
+import WebSocket from 'ws';
+globalThis.WebSocket = WebSocket;
+
 import 'dotenv/config';
 import { app } from './app.js';
 import connectDB from './config/db.js';

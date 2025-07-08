@@ -68,6 +68,46 @@ curl http://localhost:3000/id/getKeys
 }
 ```
 
+### GET /id/gate/:wa_gate_id
+
+Retrieves a persisted identity by its WhatsApp Gate ID, returning only public information.
+
+**Path Parameters**  
+| Name       | Type   | Required | Description                     |
+|------------|--------|----------|---------------------------------|
+| wa_gate_id | string | Yes      | The WhatsApp Gate identifier    |
+
+**Request**  
+```bash
+curl http://localhost:3000/id/gate/{wa_gate_id}
+```
+
+**Response 200**  
+```json
+{
+  "pubkey": "026f...9cde",
+  "npub": "npub1...",
+  "name": "Alice",
+  "wa_gate_id": "alice123"
+}
+```
+
+**Response 400**  
+```json
+{
+  "error": "BadRequest",
+  "message": "wa_gate_id parameter is required"
+}
+```
+
+**Response 404**  
+```json
+{
+  "error": "NotFound",
+  "message": "Identity not found for wa_gate_id alice123"
+}
+```
+
 ---
 
 ## Proof-of-Work
