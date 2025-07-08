@@ -13,7 +13,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@cashu/cashu-ts": "^2.4.2",
+    "@cashu/cashu-ts": "^2.5.2",
     "@nostr-dev-kit/ndk": "^2.13.3",
     "axios": "^1.9.0",
     "dotenv": "^16.5.0",
@@ -28,7 +28,9 @@
   "devDependencies": {
     "@babel/core": "^7.26.10",
     "@babel/preset-env": "^7.26.9",
+    "@types/node": "^24.0.10",
     "babel-jest": "^29.7.0",
-    "jest": "^29.7.0"
+    "jest": "^29.7.0",
+    "typescript": "^5.8.3"
   }
 }
