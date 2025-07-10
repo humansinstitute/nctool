@@ -156,6 +156,384 @@ async function tailEvents(sessionKey) {
   es.onerror = (err) => output(`Stream error: ${err.message}`);
 }
 
+// ==================== CASHU WALLET FUNCTIONS ====================
+
+async function checkPendingReceipts(sessionKey) {
+  try {
+    console.log("🔄 Checking for completed payments...");
+    const { data } = await axios.get(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/receipts/check`
+    );
+
+    if (data.receipts && data.receipts.length > 0) {
+      const totalAmount = data.receipts.reduce(
+        (sum, receipt) => sum + receipt.amount,
+        0
+      );
+      console.log(
+        `✅ Found ${data.receipts.length} completed payment(s): +${totalAmount} sats minted!`
+      );
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    // Log error but don't disrupt menu flow
+    console.error("Receipt check error:", err.message);
+    return false;
+  }
+}
+
+async function cashuWalletMenu(sessionKey) {
+  while (true) {
+    // Check for pending receipts before displaying menu
+    await checkPendingReceipts(sessionKey);
+
+    console.log(`\n=== Cashu Wallet Menu (${sessionKey.name}) ===`);
+    console.log("1) Check wallet balance");
+    console.log("2) Mint tokens (Lightning to eCash)");
+    console.log("3) Send tokens");
+    console.log("4) Receive tokens");
+    console.log("5) Melt tokens (eCash to Lightning)");
+    console.log("6) Check proof states");
+    console.log("7) View transaction history");
+    console.log("8) Get wallet info");
+    console.log("9) Return to main menu");
+
+    const choice = await prompt("Enter 1-9: ");
+
+    try {
+      switch (choice) {
+        case "1":
+          await checkWalletBalance(sessionKey);
+          break;
+        case "2":
+          await mintTokens(sessionKey);
+          break;
+        case "3":
+          await sendTokens(sessionKey);
+          break;
+        case "4":
+          await receiveTokens(sessionKey);
+          break;
+        case "5":
+          await meltTokens(sessionKey);
+          break;
+        case "6":
+          await checkProofStates(sessionKey);
+          break;
+        case "7":
+          await viewTransactionHistory(sessionKey);
+          break;
+        case "8":
+          await getWalletInfo(sessionKey);
+          break;
+        case "9":
+          return; // Return to main menu
+        default:
+          console.log("Invalid choice. Please enter 1-9.");
+      }
+    } catch (err) {
+      const errorMsg =
+        err.response && err.response.data
+          ? err.response.data.message || JSON.stringify(err.response.data)
+          : err.message || String(err);
+      console.error("Error:", errorMsg);
+    }
+  }
+}
+
+async function checkWalletBalance(sessionKey) {
+  console.log("\n--- Check Wallet Balance ---");
+  try {
+    const { data } = await axios.get(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/balance`
+    );
+    console.log("\n✅ Wallet Balance:");
+    console.log(`Total Balance: ${data.balance} sats`);
+    if (data.details) {
+      console.log("\nBalance Details:");
+      Object.entries(data.details).forEach(([mint, amount]) => {
+        console.log(`  ${mint}: ${amount} sats`);
+      });
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function mintTokens(sessionKey) {
+  console.log("\n--- Mint Tokens (Lightning to eCash) ---");
+  console.log("Convert Lightning sats to eCash tokens");
+
+  const amountStr = await prompt("Enter amount in sats (e.g., 1000): ");
+  const amount = parseInt(amountStr, 10);
+
+  if (isNaN(amount) || amount <= 0) {
+    console.log("❌ Invalid amount. Please enter a positive number.");
+    return;
+  }
+
+  console.log(`\nMinting ${amount} sats...`);
+  try {
+    const { data } = await axios.post(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/mint`,
+      {
+        amount,
+      }
+    );
+
+    console.log("\n✅ Tokens minted successfully!");
+    console.log(`Amount: ${data.amount} sats`);
+    if (data.invoice) {
+      console.log(`Lightning Invoice: ${data.invoice}`);
+    }
+    if (data.tokens) {
+      console.log(`Tokens created: ${data.tokens.length} token(s)`);
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function sendTokens(sessionKey) {
+  console.log("\n--- Send Tokens ---");
+  console.log("Send eCash tokens to another user");
+
+  const amountStr = await prompt("Enter amount in sats (e.g., 500): ");
+  const amount = parseInt(amountStr, 10);
+
+  if (isNaN(amount) || amount <= 0) {
+    console.log("❌ Invalid amount. Please enter a positive number.");
+    return;
+  }
+
+  const recipientPubkey = await prompt(
+    "Enter recipient public key (optional, press Enter to skip): "
+  );
+
+  console.log(`\nSending ${amount} sats...`);
+  try {
+    const requestBody = { amount };
+    if (recipientPubkey.trim()) {
+      requestBody.recipientPubkey = recipientPubkey.trim();
+    }
+
+    const { data } = await axios.post(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/send`,
+      requestBody
+    );
+
+    console.log("\n✅ Tokens sent successfully!");
+    console.log(`Amount: ${data.amount} sats`);
+    console.log(`Encoded Token: ${data.encodedToken}`);
+    console.log("\n📋 Share this encoded token with the recipient:");
+    console.log(`${data.encodedToken}`);
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function receiveTokens(sessionKey) {
+  console.log("\n--- Receive Tokens ---");
+  console.log("Receive eCash tokens from an encoded token");
+
+  const encodedToken = await prompt("Enter encoded token (cashuAey...): ");
+
+  if (!encodedToken.trim()) {
+    console.log("❌ Encoded token is required.");
+    return;
+  }
+
+  const privateKey = await prompt(
+    "Enter private key for P2PK tokens (optional, press Enter to skip): "
+  );
+
+  console.log("\nReceiving tokens...");
+  try {
+    const requestBody = { encodedToken: encodedToken.trim() };
+    if (privateKey.trim()) {
+      requestBody.privateKey = privateKey.trim();
+    }
+
+    const { data } = await axios.post(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/receive`,
+      requestBody
+    );
+
+    console.log("\n✅ Tokens received successfully!");
+    console.log(`Amount: ${data.amount} sats`);
+    if (data.proofs) {
+      console.log(`Proofs received: ${data.proofs.length} proof(s)`);
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function meltTokens(sessionKey) {
+  console.log("\n--- Melt Tokens (eCash to Lightning) ---");
+  console.log("Convert eCash tokens to Lightning payment");
+
+  const invoice = await prompt("Enter Lightning invoice (lnbc...): ");
+
+  if (!invoice.trim()) {
+    console.log("❌ Lightning invoice is required.");
+    return;
+  }
+
+  console.log("\nMelting tokens...");
+  try {
+    const { data } = await axios.post(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/melt`,
+      {
+        invoice: invoice.trim(),
+      }
+    );
+
+    console.log("\n✅ Tokens melted successfully!");
+    console.log(`Amount: ${data.amount} sats`);
+    if (data.fee) {
+      console.log(`Fee: ${data.fee} sats`);
+    }
+    if (data.preimage) {
+      console.log(`Payment Preimage: ${data.preimage}`);
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function checkProofStates(sessionKey) {
+  console.log("\n--- Check Proof States ---");
+  console.log("Check the status of proofs with the mint");
+
+  const proofsInput = await prompt(
+    "Enter proofs JSON array (optional, press Enter to check all): "
+  );
+
+  console.log("\nChecking proof states...");
+  try {
+    let url = `${API_BASE}/api/wallet/${sessionKey.npub}/proofs/status`;
+    if (proofsInput.trim()) {
+      try {
+        const proofs = JSON.parse(proofsInput.trim());
+        url += `?proofs=${encodeURIComponent(JSON.stringify(proofs))}`;
+      } catch (parseErr) {
+        console.log(
+          "❌ Invalid JSON format for proofs. Checking all proofs instead."
+        );
+      }
+    }
+
+    const { data } = await axios.get(url);
+
+    console.log("\n✅ Proof states retrieved:");
+    if (data.states && Array.isArray(data.states)) {
+      data.states.forEach((state, index) => {
+        console.log(`  Proof ${index + 1}: ${state.state || "unknown"}`);
+      });
+    } else {
+      console.log(JSON.stringify(data, null, 2));
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function viewTransactionHistory(sessionKey) {
+  console.log("\n--- View Transaction History ---");
+
+  const limitStr = await prompt(
+    "Enter number of transactions to show (1-100, default 10): "
+  );
+  const limit = limitStr.trim()
+    ? Math.min(Math.max(parseInt(limitStr, 10), 1), 100)
+    : 10;
+
+  const skipStr = await prompt(
+    "Enter number of transactions to skip (default 0): "
+  );
+  const skip = skipStr.trim() ? Math.max(parseInt(skipStr, 10), 0) : 0;
+
+  const transactionType = await prompt(
+    "Filter by transaction type (mint/melt/send/receive, optional): "
+  );
+  const mintUrl = await prompt("Filter by mint URL (optional): ");
+
+  console.log("\nRetrieving transaction history...");
+  try {
+    let url = `${API_BASE}/api/wallet/${sessionKey.npub}/transactions?limit=${limit}&skip=${skip}`;
+    if (transactionType.trim()) {
+      url += `&transaction_type=${encodeURIComponent(transactionType.trim())}`;
+    }
+    if (mintUrl.trim()) {
+      url += `&mint_url=${encodeURIComponent(mintUrl.trim())}`;
+    }
+
+    const { data } = await axios.get(url);
+
+    console.log(
+      `\n✅ Transaction History (${
+        data.transactions?.length || 0
+      } transactions):`
+    );
+    if (data.transactions && data.transactions.length > 0) {
+      data.transactions.forEach((tx, index) => {
+        console.log(
+          `\n${index + 1}. ${tx.transaction_type?.toUpperCase() || "UNKNOWN"}`
+        );
+        console.log(`   Amount: ${tx.amount} sats`);
+        console.log(`   Date: ${new Date(tx.timestamp).toLocaleString()}`);
+        console.log(`   Mint: ${tx.mint_url || "N/A"}`);
+        if (tx.status) {
+          console.log(`   Status: ${tx.status}`);
+        }
+      });
+    } else {
+      console.log("No transactions found.");
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function getWalletInfo(sessionKey) {
+  console.log("\n--- Get Wallet Info ---");
+
+  console.log("Retrieving wallet information...");
+  try {
+    const { data } = await axios.get(
+      `${API_BASE}/api/wallet/${sessionKey.npub}/info`
+    );
+
+    console.log("\n✅ Wallet Information:");
+    console.log(`NPub: ${data.npub || sessionKey.npub}`);
+    console.log(`Mint URL: ${data.mint || "N/A"}`);
+    console.log(`Public Key (P2PK): ${data.p2pkPub || "N/A"}`);
+    console.log(`Total Balance: ${data.balance || 0} sats`);
+
+    if (data.proofCount !== undefined) {
+      console.log(`Total Proofs: ${data.proofCount}`);
+    }
+
+    if (data.mints && Array.isArray(data.mints)) {
+      console.log("\nConnected Mints:");
+      data.mints.forEach((mint, index) => {
+        console.log(`  ${index + 1}. ${mint}`);
+      });
+    }
+
+    if (data.lastActivity) {
+      console.log(
+        `Last Activity: ${new Date(data.lastActivity).toLocaleString()}`
+      );
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
 async function main() {
   await connectDB();
   const sessionKey = await chooseKey();
@@ -169,8 +547,9 @@ async function main() {
     console.log("d) Publish action");
     console.log("f) Sign remotely");
     console.log("g) Create eCash wallet");
+    console.log("h) Cashu Wallet Menu");
     console.log("e) Exit");
-    const choice = await prompt("Enter a, b, c, d, f, g or e: ");
+    const choice = await prompt("Enter a, b, c, d, f, g, h or e: ");
 
     try {
       if (choice === "a") {
@@ -271,7 +650,7 @@ async function main() {
         }
       } else if (choice === "g") {
         try {
-          const { data } = await axios.post(`${API_BASE}/wallet/create`, {
+          const { data } = await axios.post(`${API_BASE}/api/wallet/create`, {
             npub: sessionKey.npub,
           });
           if (data.message === "Wallet already exists") {
@@ -295,6 +674,8 @@ async function main() {
           console.error("Error creating eCash wallet:", errorMsg);
         }
         continue;
+      } else if (choice === "h") {
+        await cashuWalletMenu(sessionKey);
       } else if (choice === "e") {
         console.log("Exiting.");
         process.exit(0);
