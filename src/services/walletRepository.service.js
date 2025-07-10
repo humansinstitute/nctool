@@ -182,19 +182,103 @@ class WalletRepositoryService {
    */
   async updatePendingTransaction(tokenId, updates) {
     try {
-      const updatedToken = await CashuToken.findByIdAndUpdate(
-        tokenId,
-        { $set: updates },
-        { new: true, runValidators: true }
-      );
+      // First, find the token to ensure it exists and get current state
+      const token = await CashuToken.findById(tokenId);
 
-      if (!updatedToken) {
-        throw new Error(`Token with ID ${tokenId} not found`);
+      if (!token) {
+        const error = new Error(`Token with ID ${tokenId} not found`);
+        console.error(`[updatePendingTransaction] Token not found:`, {
+          tokenId,
+          timestamp: new Date().toISOString(),
+        });
+        throw error;
       }
 
-      return updatedToken;
+      // Log the current state and intended updates for debugging
+      console.log(`[updatePendingTransaction] Updating token:`, {
+        tokenId,
+        currentStatus: token.status,
+        currentTotalAmount: token.total_amount,
+        proofsCount: token.proofs?.length || 0,
+        updates,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Validate status transitions
+      if (
+        updates.status &&
+        token.status !== "pending" &&
+        updates.status !== token.status
+      ) {
+        const error = new Error(
+          `Invalid status transition from '${token.status}' to '${updates.status}'. Only pending transactions can be updated.`
+        );
+        console.error(`[updatePendingTransaction] Invalid status transition:`, {
+          tokenId,
+          currentStatus: token.status,
+          requestedStatus: updates.status,
+          timestamp: new Date().toISOString(),
+        });
+        throw error;
+      }
+
+      // Apply updates to the document
+      Object.keys(updates).forEach((key) => {
+        token[key] = updates[key];
+      });
+
+      // Save the document to trigger all validation and pre-save hooks
+      const savedToken = await token.save();
+
+      // Log successful update
+      console.log(`[updatePendingTransaction] Successfully updated token:`, {
+        tokenId,
+        newStatus: savedToken.status,
+        newTotalAmount: savedToken.total_amount,
+        proofsCount: savedToken.proofs?.length || 0,
+        timestamp: new Date().toISOString(),
+      });
+
+      return savedToken;
     } catch (error) {
-      throw new Error(`Failed to update pending transaction: ${error.message}`);
+      // Enhanced error logging with context
+      console.error(`[updatePendingTransaction] Failed to update token:`, {
+        tokenId,
+        updates,
+        errorMessage: error.message,
+        errorName: error.name,
+        validationErrors: error.errors ? Object.keys(error.errors) : null,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Provide more specific error messages based on error type
+      if (error.name === "ValidationError") {
+        const validationDetails = Object.values(error.errors)
+          .map((err) => err.message)
+          .join(", ");
+        throw new Error(
+          `Validation failed for pending transaction update: ${validationDetails}`
+        );
+      }
+
+      if (error.name === "CastError") {
+        throw new Error(
+          `Invalid data type in update for token ${tokenId}: ${error.message}`
+        );
+      }
+
+      // Re-throw our custom errors as-is
+      if (
+        error.message.includes("Token with ID") ||
+        error.message.includes("Invalid status transition")
+      ) {
+        throw error;
+      }
+
+      // Generic error with context
+      throw new Error(
+        `Failed to update pending transaction ${tokenId}: ${error.message}`
+      );
     }
   }
 

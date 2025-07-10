@@ -16,6 +16,9 @@ import {
   checkProofStates as cashuCheckProofStates,
 } from "../services/cashu.service.js";
 import walletRepositoryService from "../services/walletRepository.service.js";
+import ValidationService from "../services/validation.service.js";
+import MonitoringService from "../services/monitoring.service.js";
+import RecoveryService from "../services/recovery.service.js";
 import { logger } from "../utils/logger.js";
 
 const MINT_URL = process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
@@ -261,26 +264,41 @@ export const getBalance = asyncHandler(async (req, res) => {
 export const mintTokens = asyncHandler(async (req, res) => {
   const { npub } = req.params;
   const { amount } = req.body;
-  logger.info("Starting mint tokens operation", { npub, amount });
+  logger.info("Starting mint tokens operation with safeguards", {
+    npub,
+    amount,
+  });
 
-  if (!npub) {
-    return res.status(400).json({ error: "npub is required" });
-  }
+  // Enhanced input validation using ValidationService
+  const validation = await ValidationService.validateMintingRequest({
+    npub,
+    amount,
+  });
 
-  if (!amount || typeof amount !== "number" || amount <= 0) {
+  if (!validation.isValid) {
+    logger.warn("Minting request validation failed", {
+      npub,
+      amount,
+      errors: validation.errors,
+    });
+
     return res.status(400).json({
-      error: "amount is required and must be a positive number",
+      error: "Validation failed",
+      details: validation.errors,
+      warnings: validation.warnings,
     });
   }
 
-  // Validate npub format
-  try {
-    nip19.decode(npub);
-  } catch (error) {
-    return res.status(400).json({ error: "Invalid npub format" });
+  // Log warnings if any
+  if (validation.warnings.length > 0) {
+    logger.warn("Minting request has warnings", {
+      npub,
+      amount,
+      warnings: validation.warnings,
+    });
   }
 
-  // Validate user exists
+  // Validate user exists (additional check)
   const keys = await getAllKeys();
   const keyObj = keys.find((k) => k.npub === npub);
   if (!keyObj) {
@@ -288,9 +306,19 @@ export const mintTokens = asyncHandler(async (req, res) => {
   }
 
   try {
+    // Track minting attempt
+    MonitoringService.trackMintingAttempt(npub, amount, null);
+
     const mintResult = await cashuMintTokens(npub, amount);
 
-    logger.info("Successfully created mint quote", {
+    // Track successful minting
+    MonitoringService.trackMintingSuccess(
+      npub,
+      mintResult.transactionId,
+      mintResult
+    );
+
+    logger.info("Successfully created mint quote with safeguards", {
       npub,
       amount,
       quoteId: mintResult.quote,
@@ -305,8 +333,12 @@ export const mintTokens = asyncHandler(async (req, res) => {
       transactionId: mintResult.transactionId,
       expiry: mintResult.expiry,
       mintUrl: mintResult.mintUrl,
+      warnings: validation.warnings,
     });
   } catch (error) {
+    // Track failed minting
+    MonitoringService.trackMintingFailure(npub, null, error.message);
+
     logger.error("Failed to mint tokens", {
       npub,
       amount,
@@ -326,40 +358,35 @@ export const mintTokens = asyncHandler(async (req, res) => {
 export const completeMintTokens = asyncHandler(async (req, res) => {
   const { npub } = req.params;
   const { quoteId, amount, transactionId } = req.body;
-  logger.info("Starting complete mint operation", {
+  const startTime = Date.now();
+
+  logger.info("Starting complete mint operation with safeguards", {
     npub,
     quoteId,
     amount,
     transactionId,
   });
 
-  if (!npub) {
-    return res.status(400).json({ error: "npub is required" });
-  }
+  // Enhanced input validation using ValidationService
+  const validation = ValidationService.validateCompletionRequest({
+    npub,
+    quoteId,
+    amount,
+    transactionId,
+  });
 
-  if (!quoteId || typeof quoteId !== "string") {
-    return res.status(400).json({
-      error: "quoteId is required and must be a string",
+  if (!validation.isValid) {
+    logger.warn("Completion request validation failed", {
+      npub,
+      quoteId,
+      transactionId,
+      errors: validation.errors,
     });
-  }
 
-  if (!amount || typeof amount !== "number" || amount <= 0) {
     return res.status(400).json({
-      error: "amount is required and must be a positive number",
+      error: "Validation failed",
+      details: validation.errors,
     });
-  }
-
-  if (!transactionId || typeof transactionId !== "string") {
-    return res.status(400).json({
-      error: "transactionId is required and must be a string",
-    });
-  }
-
-  // Validate npub format
-  try {
-    nip19.decode(npub);
-  } catch (error) {
-    return res.status(400).json({ error: "Invalid npub format" });
   }
 
   // Validate user exists
@@ -370,6 +397,9 @@ export const completeMintTokens = asyncHandler(async (req, res) => {
   }
 
   try {
+    // Track completion attempt
+    MonitoringService.trackCompletionAttempt(npub, transactionId, quoteId);
+
     const completionResult = await completeMinting(
       npub,
       quoteId,
@@ -377,11 +407,22 @@ export const completeMintTokens = asyncHandler(async (req, res) => {
       transactionId
     );
 
-    logger.info("Successfully completed minting", {
+    const completionTime = Date.now() - startTime;
+
+    // Track successful completion
+    MonitoringService.trackCompletionSuccess(
+      npub,
+      transactionId,
+      completionTime,
+      completionResult
+    );
+
+    logger.info("Successfully completed minting with safeguards", {
       npub,
       quoteId,
       transactionId: completionResult.transactionId,
       totalAmount: completionResult.totalAmount,
+      completionTime: `${completionTime}ms`,
     });
 
     res.json({
@@ -391,8 +432,16 @@ export const completeMintTokens = asyncHandler(async (req, res) => {
       transactionId: completionResult.transactionId,
       totalAmount: completionResult.totalAmount,
       mintUrl: MINT_URL,
+      completionTime,
     });
   } catch (error) {
+    // Track failed completion
+    MonitoringService.trackCompletionFailure(
+      npub,
+      transactionId,
+      error.message
+    );
+
     logger.error("Failed to complete minting", {
       npub,
       quoteId,
@@ -400,6 +449,48 @@ export const completeMintTokens = asyncHandler(async (req, res) => {
       transactionId,
       error: error.message,
     });
+
+    // If it's an updatePendingTransaction error, try recovery
+    if (error.message.includes("Failed to update pending transaction")) {
+      logger.info("Attempting recovery for failed updatePendingTransaction", {
+        npub,
+        transactionId,
+      });
+
+      try {
+        // Find the token to get its ID
+        const tokens = await walletRepositoryService.findTokensByTransactionId(
+          transactionId
+        );
+        if (tokens.length > 0) {
+          const retryResult =
+            await RecoveryService.retryUpdatePendingTransaction(tokens[0]._id, {
+              status: "failed",
+              metadata: {
+                ...tokens[0].metadata,
+                failed_at: new Date(),
+                failure_reason: error.message,
+                recovery_attempted: true,
+              },
+            });
+
+          if (retryResult.success) {
+            logger.info("Recovery successful for updatePendingTransaction", {
+              npub,
+              transactionId,
+              attempts: retryResult.attempts,
+            });
+          }
+        }
+      } catch (recoveryError) {
+        logger.error("Recovery failed for updatePendingTransaction", {
+          npub,
+          transactionId,
+          recoveryError: recoveryError.message,
+        });
+      }
+    }
+
     res.status(500).json({
       error: "Failed to complete minting",
       message: error.message,
@@ -988,11 +1079,179 @@ export const checkPendingReceipts = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     logger.error("Failed to check pending receipts", {
-      npub,
       error: error.message,
     });
     res.status(500).json({
       error: "Failed to check pending receipts",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Get system health and monitoring metrics
+ * GET /api/wallet/system/health
+ */
+export const getSystemHealth = asyncHandler(async (req, res) => {
+  logger.info("Getting system health metrics");
+
+  try {
+    const healthMetrics = await MonitoringService.getHealthMetrics();
+    const runtimeMetrics = MonitoringService.getMintingMetrics();
+
+    logger.info("Successfully retrieved system health", {
+      status: healthMetrics.status,
+      alertCount: healthMetrics.alerts?.length || 0,
+    });
+
+    res.json({
+      success: true,
+      health: healthMetrics,
+      runtime: runtimeMetrics,
+    });
+  } catch (error) {
+    logger.error("Failed to get system health", {
+      error: error.message,
+    });
+    res.status(500).json({
+      error: "Failed to get system health",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Clean up stuck pending transactions
+ * POST /api/wallet/:npub/cleanup
+ */
+export const cleanupStuckTransactions = asyncHandler(async (req, res) => {
+  const { npub } = req.params;
+  const { dryRun = false, maxAge } = req.body;
+
+  logger.info("Starting stuck transaction cleanup", {
+    npub,
+    dryRun,
+  });
+
+  // Validate npub format
+  try {
+    nip19.decode(npub);
+  } catch (error) {
+    return res.status(400).json({ error: "Invalid npub format" });
+  }
+
+  // Validate user exists
+  const keys = await getAllKeys();
+  const keyObj = keys.find((k) => k.npub === npub);
+  if (!keyObj) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  try {
+    const cleanupOptions = {};
+    if (dryRun !== undefined) cleanupOptions.dryRun = dryRun;
+    if (maxAge) cleanupOptions.maxAge = maxAge;
+
+    const cleanupResult = await RecoveryService.cleanupStuckTransactions(
+      npub,
+      cleanupOptions
+    );
+
+    logger.info("Cleanup completed", {
+      npub,
+      dryRun,
+      processed: cleanupResult.processed,
+      cleaned: cleanupResult.cleaned,
+      failed: cleanupResult.failed,
+    });
+
+    res.json({
+      success: true,
+      ...cleanupResult,
+    });
+  } catch (error) {
+    logger.error("Failed to cleanup stuck transactions", {
+      npub,
+      error: error.message,
+    });
+    res.status(500).json({
+      error: "Failed to cleanup stuck transactions",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Get recovery statistics for a user
+ * GET /api/wallet/:npub/recovery/stats
+ */
+export const getRecoveryStats = asyncHandler(async (req, res) => {
+  const { npub } = req.params;
+  logger.info("Getting recovery stats", { npub });
+
+  // Validate npub format
+  try {
+    nip19.decode(npub);
+  } catch (error) {
+    return res.status(400).json({ error: "Invalid npub format" });
+  }
+
+  // Validate user exists
+  const keys = await getAllKeys();
+  const keyObj = keys.find((k) => k.npub === npub);
+  if (!keyObj) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  try {
+    const recoveryStats = await RecoveryService.getRecoveryStats(npub);
+
+    logger.info("Successfully retrieved recovery stats", {
+      npub,
+      totalPending: recoveryStats.totalPending,
+      stuckOneHour: recoveryStats.stuckOneHour,
+    });
+
+    res.json({
+      success: true,
+      stats: recoveryStats,
+    });
+  } catch (error) {
+    logger.error("Failed to get recovery stats", {
+      npub,
+      error: error.message,
+    });
+    res.status(500).json({
+      error: "Failed to get recovery stats",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Manual alert check for stuck transactions
+ * POST /api/wallet/system/check-alerts
+ */
+export const checkAlerts = asyncHandler(async (req, res) => {
+  logger.info("Manual alert check requested");
+
+  try {
+    const alertResult = await MonitoringService.checkStuckTransactionAlerts();
+
+    logger.info("Alert check completed", {
+      alertSent: alertResult.alertSent,
+    });
+
+    res.json({
+      success: true,
+      ...alertResult,
+    });
+  } catch (error) {
+    logger.error("Failed to check alerts", {
+      error: error.message,
+    });
+    res.status(500).json({
+      error: "Failed to check alerts",
       message: error.message,
     });
   }
