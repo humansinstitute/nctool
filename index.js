@@ -532,25 +532,26 @@ async function getWalletInfo(sessionKey) {
     );
 
     console.log("\n✅ Wallet Information:");
-    console.log(`NPub: ${data.npub || sessionKey.npub}`);
-    console.log(`Mint URL: ${data.mint || "N/A"}`);
-    console.log(`Public Key (P2PK): ${data.p2pkPub || "N/A"}`);
-    console.log(`Total Balance: ${data.balance || 0} sats`);
+    console.log(`NPub: ${data.walletInfo?.npub || sessionKey.npub}`);
+    console.log(`Mint URL: ${data.walletInfo?.mintUrl || "N/A"}`);
+    console.log(
+      `Public Key (P2PK): ${data.walletInfo?.walletDetails?.p2pkPub || "N/A"}`
+    );
+    console.log(`Total Balance: ${data.walletInfo?.balance || 0} sats`);
 
-    if (data.proofCount !== undefined) {
-      console.log(`Total Proofs: ${data.proofCount}`);
-    }
-
-    if (data.mints && Array.isArray(data.mints)) {
-      console.log("\nConnected Mints:");
-      data.mints.forEach((mint, index) => {
-        console.log(`  ${index + 1}. ${mint}`);
-      });
-    }
-
-    if (data.lastActivity) {
+    if (data.walletInfo?.statistics?.total_transactions !== undefined) {
       console.log(
-        `Last Activity: ${new Date(data.lastActivity).toLocaleString()}`
+        `Total Transactions: ${data.walletInfo.statistics.total_transactions}`
+      );
+    }
+
+    if (data.walletInfo?.statistics?.wallet_count !== undefined) {
+      console.log(`Wallet Count: ${data.walletInfo.statistics.wallet_count}`);
+    }
+
+    if (data.walletInfo?.createdAt) {
+      console.log(
+        `Created At: ${new Date(data.walletInfo.createdAt).toLocaleString()}`
       );
     }
   } catch (err) {

@@ -904,7 +904,7 @@ export const getWalletInfo = asyncHandler(async (req, res) => {
     const walletInfo = {
       npub,
       mintUrl: MINT_URL,
-      balance,
+      balance: balance.total_balance, // Extract just the total balance number for client compatibility
       statistics: walletStats,
       walletDetails: walletDetails
         ? {

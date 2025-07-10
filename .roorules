@@ -28,3 +28,5 @@ Create ADRs in /doc/adr for:
 - All data access should be via the API layer in abstract as this project is for developing test services I can port to other projects
 - Prefer composition over inheritance
 - Use repository pattern for data access
+- Changes should always be minimal and targetted
+- Changes hsould be made sequentially starting with updates to the data layer first then, apis, busines logic, UX
