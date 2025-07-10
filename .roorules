@@ -1,0 +1,30 @@
+# Project Guidelines
+
+- The Client is at /index.js
+- The Server is loaded from /src/server.js
+
+## Documentation Requirements
+
+- Update relevant documentation in /doc when modifying features
+- Keep README.md in sync with new capabilities
+- Maintain changelog entries in CHANGELOG.md
+- Tempoary documentation e.g. checkllist, test reports or tempoary instructiosn to yourself should be craeted in doc/temp/ directory
+
+## Architecture Decision Records
+
+Create ADRs in /doc/adr for:
+
+- Major dependency changes
+- Architectural pattern changes
+- New integration patterns
+- Database schema changes
+- Follow template in /doc/adr/template.md
+
+## Code Style & Patterns
+
+- When planning new features or changes consider reviewing documentation in /doc/ for apis and client work.
+- MERN stack
+- Use mongoose for management of mongo records
+- All data access should be via the API layer in abstract as this project is for developing test services I can port to other projects
+- Prefer composition over inheritance
+- Use repository pattern for data access
