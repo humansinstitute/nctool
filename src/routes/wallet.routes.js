@@ -108,6 +108,37 @@ router.get("/:npub/info", walletController.getWalletInfo);
  * Check pending receipts and automatically complete paid minting operations
  * GET /api/wallet/:npub/receipts/check
  */
+
+// ==================== MONITORING & RECOVERY ENDPOINTS ====================
+
+/**
+ * Get system health and monitoring metrics
+ * GET /api/wallet/system/health
+ */
+router.get("/system/health", walletController.getSystemHealth);
+
+/**
+ * Manual alert check for stuck transactions
+ * POST /api/wallet/system/check-alerts
+ */
+router.post("/system/check-alerts", walletController.checkAlerts);
+
+/**
+ * Clean up stuck pending transactions
+ * POST /api/wallet/:npub/cleanup
+ *
+ * Body: {
+ *   "dryRun": false,
+ *   "maxAge": 3600000 (optional, max age in milliseconds)
+ * }
+ */
+router.post("/:npub/cleanup", walletController.cleanupStuckTransactions);
+
+/**
+ * Get recovery statistics for a user
+ * GET /api/wallet/:npub/recovery/stats
+ */
+router.get("/:npub/recovery/stats", walletController.getRecoveryStats);
 router.get("/:npub/receipts/check", walletController.checkPendingReceipts);
 
 export default router;

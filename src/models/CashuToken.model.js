@@ -97,14 +97,7 @@ const CashuTokenSchema = new mongoose.Schema(
     },
     total_amount: {
       type: Number,
-      min: {
-        value: function () {
-          // Allow 0 for pending transactions
-          return this.status === "pending" ? 0 : 1;
-        },
-        message:
-          "Total amount must be positive (or 0 for pending transactions)",
-      },
+      min: [0, "Total amount cannot be negative"],
       validate: {
         validator: function (v) {
           // Skip validation if total_amount is not set (will be calculated in pre-save)
@@ -192,7 +185,7 @@ CashuTokenSchema.index({ mint_url: 1, status: 1 });
 CashuTokenSchema.index({ "proofs.secret": 1 });
 
 /**
- * Pre-save middleware to calculate total_amount and set spent_at
+ * Pre-save middleware to calculate total_amount, validate status-dependent rules, and set spent_at
  */
 CashuTokenSchema.pre("save", function (next) {
   // Calculate total amount from proofs
@@ -206,6 +199,13 @@ CashuTokenSchema.pre("save", function (next) {
     this.total_amount = 0;
   }
 
+  // Status-dependent validation for total_amount
+  if (this.status !== "pending" && this.total_amount <= 0) {
+    return next(
+      new Error("Total amount must be positive for non-pending transactions")
+    );
+  }
+
   // Set spent_at timestamp when status changes to spent
   if (this.status === "spent" && !this.spent_at) {
     this.spent_at = new Date();
@@ -213,6 +213,41 @@ CashuTokenSchema.pre("save", function (next) {
 
   next();
 });
+
+/**
+ * Pre-update middleware to handle validation during findByIdAndUpdate operations
+ */
+CashuTokenSchema.pre(
+  ["findOneAndUpdate", "updateOne", "updateMany"],
+  function (next) {
+    const update = this.getUpdate();
+
+    // If status is being updated to non-pending and total_amount is 0 or negative, prevent the update
+    if (update.$set && update.$set.status && update.$set.status !== "pending") {
+      if (
+        update.$set.total_amount !== undefined &&
+        update.$set.total_amount <= 0
+      ) {
+        return next(
+          new Error(
+            "Total amount must be positive for non-pending transactions"
+          )
+        );
+      }
+    }
+
+    // Set spent_at timestamp when status changes to spent
+    if (
+      update.$set &&
+      update.$set.status === "spent" &&
+      !update.$set.spent_at
+    ) {
+      update.$set.spent_at = new Date();
+    }
+
+    next();
+  }
+);
 
 /**
  * Instance method to mark token as spent
