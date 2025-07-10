@@ -362,7 +362,7 @@ async function receiveTokens(sessionKey) {
     );
 
     console.log("\n✅ Tokens received successfully!");
-    console.log(`Amount: ${data.amount} sats`);
+    console.log(`Amount: ${data.totalAmount || 0} sats`);
     if (data.proofs) {
       console.log(`Proofs received: ${data.proofs.length} proof(s)`);
     }
@@ -480,14 +480,38 @@ async function viewTransactionHistory(sessionKey) {
     );
     if (data.transactions && data.transactions.length > 0) {
       data.transactions.forEach((tx, index) => {
-        console.log(
-          `\n${index + 1}. ${tx.transaction_type?.toUpperCase() || "UNKNOWN"}`
-        );
-        console.log(`   Amount: ${tx.amount} sats`);
-        console.log(`   Date: ${new Date(tx.timestamp).toLocaleString()}`);
-        console.log(`   Mint: ${tx.mint_url || "N/A"}`);
-        if (tx.status) {
-          console.log(`   Status: ${tx.status}`);
+        try {
+          // Safely extract values with fallbacks - map database fields to display
+          const amount =
+            typeof tx.total_amount === "number" ? tx.total_amount : 0;
+          const dateValue = tx.created_at || tx.createdAt;
+          const date = dateValue ? new Date(dateValue) : null;
+          const transactionType =
+            tx.transaction_type?.toUpperCase() || "UNKNOWN";
+
+          console.log(`\n${index + 1}. ${transactionType}`);
+          console.log(`   Amount: ${amount} sats`);
+
+          if (date && !isNaN(date.getTime())) {
+            console.log(`   Date: ${date.toLocaleString()}`);
+          } else {
+            console.log(`   Date: Unknown`);
+          }
+
+          console.log(`   Mint: ${tx.mint_url || "N/A"}`);
+          console.log(`   Status: ${tx.status || "unknown"}`);
+
+          // Optional additional details for better debugging
+          if (tx.transaction_id) {
+            console.log(
+              `   Transaction ID: ${tx.transaction_id.substring(0, 16)}...`
+            );
+          }
+        } catch (error) {
+          console.log(
+            `\n${index + 1}. ERROR displaying transaction: ${error.message}`
+          );
+          console.log(`   Raw data: ${JSON.stringify(tx, null, 2)}`);
         }
       });
     } else {
