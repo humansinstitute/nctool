@@ -302,7 +302,10 @@ CashuTokenSchema.statics.calculateBalance = async function (
   status = "unspent",
   mintUrl = null
 ) {
-  const query = { npub, status };
+  const query = { npub };
+  if (status !== null) {
+    query.status = status;
+  }
   if (mintUrl) {
     query.mint_url = mintUrl;
   }
