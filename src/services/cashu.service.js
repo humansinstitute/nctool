@@ -182,12 +182,15 @@ export async function mintTokens(npub, amount) {
       transaction_type: "minted",
       transaction_id: transactionId,
       status: "pending", // Mark as pending until payment is confirmed
+      total_amount: 0, // Explicitly set to 0 for pending transactions
       metadata: {
         source: "lightning",
         quote_id: mintQuote.quote,
         mint_amount: amount,
         invoice: mintQuote.request,
         expiry: mintQuote.expiry,
+        created_at: new Date(),
+        pending_amount: amount, // Track the expected amount when completed
       },
     });
 
@@ -228,6 +231,7 @@ export async function mintTokens(npub, amount) {
 
 /**
  * Complete minting process after Lightning invoice is paid
+ * Enhanced version with race condition protection and better error handling
  * @param {string} npub - User's Nostr npub string
  * @param {string} quoteId - Mint quote ID
  * @param {number} amount - Amount to mint
@@ -236,7 +240,7 @@ export async function mintTokens(npub, amount) {
  */
 export async function completeMinting(npub, quoteId, amount, transactionId) {
   try {
-    logger.info("Completing minting process", {
+    logger.info("Starting enhanced minting completion", {
       npub,
       quoteId,
       amount,
@@ -245,84 +249,109 @@ export async function completeMinting(npub, quoteId, amount, transactionId) {
 
     const { wallet, walletDoc } = await initializeWallet(npub);
 
-    // Check if quote is paid
+    // Double-check quote is still paid (race condition protection)
     const quoteStatus = await wallet.checkMintQuote(quoteId);
     if (quoteStatus.state !== "PAID") {
-      throw new Error(`Quote not paid yet. Status: ${quoteStatus.state}`);
+      throw new Error(
+        `Quote status changed to ${quoteStatus.state} during completion`
+      );
+    }
+
+    // Check if transaction was already completed (race condition protection)
+    const existingTokens =
+      await walletRepositoryService.findTokensByTransactionId(transactionId);
+    const pendingToken = existingTokens.find((t) => t.status === "pending");
+
+    if (!pendingToken) {
+      // Check if already completed
+      const completedToken = existingTokens.find((t) => t.status === "unspent");
+      if (completedToken) {
+        logger.warn("Transaction already completed", {
+          npub,
+          quoteId,
+          transactionId,
+          tokenId: completedToken._id,
+        });
+        return {
+          proofs: completedToken.proofs,
+          tokenId: completedToken._id,
+          transactionId,
+          totalAmount: completedToken.total_amount,
+          alreadyCompleted: true,
+        };
+      }
+      throw new Error(`No pending transaction found for ID: ${transactionId}`);
     }
 
     // Mint the proofs
+    logger.info("Minting proofs", { npub, quoteId, amount });
     const proofs = await wallet.mintProofs(amount, quoteId);
+
+    if (!proofs || proofs.length === 0) {
+      throw new Error("No proofs returned from minting operation");
+    }
+
+    const totalAmount = proofs.reduce((sum, p) => sum + p.amount, 0);
+
     logger.info("Successfully minted proofs", {
       npub,
       quoteId,
       proofsCount: proofs.length,
-      totalAmount: proofs.reduce((sum, p) => sum + p.amount, 0),
+      totalAmount,
+      expectedAmount: amount,
     });
 
-    // Check if there's an existing pending transaction to update
-    const existingTokens =
-      await walletRepositoryService.findTokensByTransactionId(transactionId);
-    let tokenDoc;
-
-    if (existingTokens.length > 0 && existingTokens[0].status === "pending") {
-      // Update the existing pending transaction with the minted proofs
-      const pendingToken = existingTokens[0];
-      tokenDoc = await walletRepositoryService.updatePendingTransaction(
-        pendingToken._id,
-        {
-          proofs,
-          status: "unspent",
-          total_amount: proofs.reduce((sum, p) => sum + p.amount, 0),
-          metadata: {
-            ...pendingToken.metadata,
-            completed_at: new Date(),
-          },
-        }
-      );
-
-      logger.info("Updated pending transaction with minted tokens", {
+    // Validate minted amount matches expected
+    if (totalAmount !== amount) {
+      logger.warn("Minted amount differs from expected", {
         npub,
-        tokenId: tokenDoc._id,
-        transactionId,
-        proofsCount: proofs.length,
-      });
-    } else {
-      // Create new token document (fallback for legacy transactions)
-      tokenDoc = await walletRepositoryService.storeTokens({
-        npub,
-        wallet_id: walletDoc._id,
-        proofs,
-        mint_url: MINT_URL,
-        transaction_type: "minted",
-        transaction_id: transactionId,
-        metadata: {
-          source: "lightning",
-          quote_id: quoteId,
-          mint_amount: amount,
-        },
-      });
-
-      logger.info("Stored minted tokens in database", {
-        npub,
-        tokenId: tokenDoc._id,
-        transactionId,
+        quoteId,
+        expectedAmount: amount,
+        actualAmount: totalAmount,
+        difference: totalAmount - amount,
       });
     }
+
+    // Update the pending transaction with enhanced validation
+    const tokenDoc = await walletRepositoryService.updatePendingTransaction(
+      pendingToken._id,
+      {
+        proofs,
+        status: "unspent",
+        total_amount: totalAmount,
+        metadata: {
+          ...pendingToken.metadata,
+          completed_at: new Date(),
+          completion_method: "background_polling",
+          actual_minted_amount: totalAmount,
+          proofs_count: proofs.length,
+        },
+      }
+    );
+
+    logger.info("Successfully updated pending transaction", {
+      npub,
+      tokenId: tokenDoc._id,
+      transactionId,
+      proofsCount: proofs.length,
+      totalAmount,
+    });
 
     return {
       proofs,
       tokenId: tokenDoc._id,
       transactionId,
-      totalAmount: proofs.reduce((sum, p) => sum + p.amount, 0),
+      totalAmount,
+      alreadyCompleted: false,
     };
   } catch (error) {
-    logger.error("Failed to complete minting", {
+    logger.error("Enhanced minting completion failed", {
       npub,
       quoteId,
       amount,
       transactionId,
       error: error.message,
+      stack: error.stack,
     });
     throw new Error(`Failed to complete minting: ${error.message}`);
   }
@@ -782,8 +811,12 @@ export async function checkProofStates(npub, proofs = null) {
 
 // ==================== BACKGROUND POLLING ====================
 
+// Store active polling intervals for cleanup
+const activePollingIntervals = new Map();
+
 /**
  * Start background polling to check if mint quote is paid and complete minting
+ * Enhanced version with improved error handling, retry logic, and cleanup
  * @param {string} npub - User's Nostr npub string
  * @param {string} quoteId - Mint quote ID to monitor
  * @param {number} amount - Amount to mint
@@ -792,55 +825,89 @@ export async function checkProofStates(npub, proofs = null) {
 function startMintPolling(npub, quoteId, amount, transactionId) {
   const POLLING_INTERVAL = 10000; // 10 seconds
   const POLLING_DURATION = 180000; // 3 minutes
+  const MAX_RETRY_ATTEMPTS = 3;
   const startTime = Date.now();
 
-  logger.info("Starting mint polling", {
+  // Create unique polling key
+  const pollingKey = `${npub}_${quoteId}_${transactionId}`;
+
+  // Check if polling is already active for this transaction
+  if (activePollingIntervals.has(pollingKey)) {
+    logger.warn("Polling already active for transaction", {
+      npub,
+      quoteId,
+      transactionId,
+      pollingKey,
+    });
+    return pollingKey;
+  }
+
+  logger.info("Starting enhanced mint polling", {
     npub,
     quoteId,
     amount,
     transactionId,
+    pollingKey,
     pollingInterval: `${POLLING_INTERVAL / 1000}s`,
     pollingDuration: `${POLLING_DURATION / 1000}s`,
+    maxRetries: MAX_RETRY_ATTEMPTS,
   });
+
+  let consecutiveErrors = 0;
+  let pollAttempts = 0;
 
   const pollInterval = setInterval(async () => {
     try {
       const elapsed = Date.now() - startTime;
+      pollAttempts++;
 
-      // Stop polling after 3 minutes
+      // Stop polling after timeout
       if (elapsed >= POLLING_DURATION) {
-        clearInterval(pollInterval);
-        logger.info("Mint polling timeout reached", {
+        await cleanupPolling(pollingKey, pollInterval, {
           npub,
           quoteId,
+          transactionId,
+          reason: "timeout",
           elapsed: `${elapsed / 1000}s`,
-          status: "timeout",
+          totalAttempts: pollAttempts,
         });
+
+        // Mark transaction as failed due to timeout
+        await markTransactionAsFailed(
+          transactionId,
+          `Polling timeout after ${elapsed / 1000}s`
+        );
         return;
       }
 
-      logger.info("Checking mint quote status", {
+      logger.info("Checking mint quote status with retry logic", {
         npub,
         quoteId,
         elapsed: `${elapsed / 1000}s`,
-        attempt: Math.floor(elapsed / POLLING_INTERVAL) + 1,
+        attempt: pollAttempts,
+        consecutiveErrors,
       });
 
-      // Initialize wallet to check quote status
-      const { wallet } = await initializeWallet(npub);
-      const quoteStatus = await wallet.checkMintQuote(quoteId);
+      // Check quote status with retry logic
+      const quoteStatus = await checkQuoteStatusWithRetry(
+        npub,
+        quoteId,
+        MAX_RETRY_ATTEMPTS
+      );
+
+      // Reset error counter on successful check
+      consecutiveErrors = 0;
 
       if (quoteStatus.state === "PAID") {
-        clearInterval(pollInterval);
-
         logger.info("Invoice paid! Completing minting automatically", {
           npub,
           quoteId,
           elapsed: `${elapsed / 1000}s`,
           status: "paid",
+          totalAttempts: pollAttempts,
         });
 
-        // Complete the minting process
+        // Complete the minting process with enhanced error handling
         try {
           const completionResult = await completeMinting(
             npub,
@@ -855,12 +922,35 @@ function startMintPolling(npub, quoteId, amount, transactionId) {
             transactionId: completionResult.transactionId,
             totalAmount: completionResult.totalAmount,
             tokenId: completionResult.tokenId,
+            totalAttempts: pollAttempts,
+          });
+
+          // Clean up polling on success
+          await cleanupPolling(pollingKey, pollInterval, {
+            npub,
+            quoteId,
+            transactionId,
+            reason: "completed",
+            elapsed: `${elapsed / 1000}s`,
+            totalAttempts: pollAttempts,
           });
         } catch (completionError) {
           logger.error("Failed to complete background minting", {
             npub,
             quoteId,
             transactionId,
+            error: completionError.message,
+            stack: completionError.stack,
+            totalAttempts: pollAttempts,
+          });
+
+          // Mark transaction as failed and cleanup
+          await markTransactionAsFailed(transactionId, completionError.message);
+          await cleanupPolling(pollingKey, pollInterval, {
+            npub,
+            quoteId,
+            transactionId,
+            reason: "completion_failed",
             error: completionError.message,
           });
         }
@@ -870,19 +960,231 @@ function startMintPolling(npub, quoteId, amount, transactionId) {
           quoteId,
           status: quoteStatus.state,
           elapsed: `${elapsed / 1000}s`,
+          attempt: pollAttempts,
+          nextCheckIn: `${POLLING_INTERVAL / 1000}s`,
         });
       }
     } catch (error) {
+      consecutiveErrors++;
+
       logger.error("Error during mint polling", {
         npub,
         quoteId,
+        transactionId,
         error: error.message,
+        consecutiveErrors,
+        maxRetries: MAX_RETRY_ATTEMPTS,
+        attempt: pollAttempts,
       });
-      // Continue polling despite errors
+
+      // Stop polling if too many consecutive errors
+      if (consecutiveErrors >= MAX_RETRY_ATTEMPTS) {
+        logger.error("Too many consecutive polling errors, stopping", {
+          npub,
+          quoteId,
+          transactionId,
+          consecutiveErrors,
+          totalAttempts: pollAttempts,
+        });
+
+        await markTransactionAsFailed(
+          transactionId,
+          `Polling failed after ${consecutiveErrors} consecutive errors: ${error.message}`
+        );
+        await cleanupPolling(pollingKey, pollInterval, {
+          npub,
+          quoteId,
+          transactionId,
+          reason: "too_many_errors",
+          consecutiveErrors,
+          lastError: error.message,
+        });
+      }
     }
   }, POLLING_INTERVAL);
 
-  // Store the interval ID in case we need to cancel it
-  // In a production system, you might want to store this in a database or cache
-  return pollInterval;
+  // Store the interval for cleanup
+  activePollingIntervals.set(pollingKey, {
+    interval: pollInterval,
+    startTime,
+    npub,
+    quoteId,
+    transactionId,
+  });
+
+  return pollingKey;
+}
+
+/**
+ * Check quote status with retry logic and database timeout handling
+ * @param {string} npub - User's npub for wallet initialization
+ * @param {string} quoteId - Quote ID to check
+ * @param {number} maxRetries - Maximum retry attempts
+ * @returns {Promise<Object>} Quote status
+ */
+async function checkQuoteStatusWithRetry(npub, quoteId, maxRetries = 3) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      logger.debug("Checking quote status", {
+        npub,
+        quoteId,
+        attempt,
+        maxRetries,
+      });
+
+      // Initialize wallet with timeout handling
+      const { wallet } = await initializeWallet(npub);
+      const status = await wallet.checkMintQuote(quoteId);
+
+      logger.debug("Quote status check successful", {
+        quoteId,
+        status: status.state,
+        attempt,
+      });
+
+      return status;
+    } catch (error) {
+      lastError = error;
+
+      logger.warn("Quote status check failed", {
+        quoteId,
+        attempt,
+        maxRetries,
+        error: error.message,
+        willRetry: attempt < maxRetries,
+      });
+
+      // Wait before retry (exponential backoff)
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw new Error(
+    `Failed to check quote status after ${maxRetries} attempts: ${lastError.message}`
+  );
+}
+
+/**
+ * Clean up polling interval and log completion
+ * @param {string} pollingKey - Unique polling identifier
+ * @param {NodeJS.Timeout} pollInterval - Interval to clear
+ * @param {Object} context - Logging context
+ */
+async function cleanupPolling(pollingKey, pollInterval, context) {
+  try {
+    // Clear the interval
+    clearInterval(pollInterval);
+
+    // Remove from active polling map
+    activePollingIntervals.delete(pollingKey);
+
+    logger.info("Polling cleanup completed", {
+      pollingKey,
+      ...context,
+      activePollingCount: activePollingIntervals.size,
+    });
+  } catch (error) {
+    logger.error("Error during polling cleanup", {
+      pollingKey,
+      error: error.message,
+      context,
+    });
+  }
+}
+
+/**
+ * Mark a transaction as failed
+ * @param {string} transactionId - Transaction ID
+ * @param {string} reason - Failure reason
+ */
+async function markTransactionAsFailed(transactionId, reason) {
+  try {
+    const existingTokens =
+      await walletRepositoryService.findTokensByTransactionId(transactionId);
+    const pendingToken = existingTokens.find((t) => t.status === "pending");
+
+    if (pendingToken) {
+      await walletRepositoryService.updatePendingTransaction(pendingToken._id, {
+        status: "failed",
+        metadata: {
+          ...pendingToken.metadata,
+          failed_at: new Date(),
+          failure_reason: reason,
+        },
+      });
+
+      logger.info("Marked transaction as failed", {
+        transactionId,
+        tokenId: pendingToken._id,
+        reason,
+      });
+    }
+  } catch (error) {
+    logger.error("Failed to mark transaction as failed", {
+      transactionId,
+      reason,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Get status of all active polling operations
+ * @returns {Array} Array of active polling operations
+ */
+export function getActivePollingStatus() {
+  const now = Date.now();
+  return Array.from(activePollingIntervals.entries()).map(([key, data]) => ({
+    pollingKey: key,
+    npub: data.npub,
+    quoteId: data.quoteId,
+    transactionId: data.transactionId,
+    elapsedTime: now - data.startTime,
+    startTime: new Date(data.startTime).toISOString(),
+  }));
+}
+
+/**
+ * Force cleanup of a specific polling operation
+ * @param {string} pollingKey - Polling key to cleanup
+ * @returns {boolean} True if cleanup was performed
+ */
+export function forceCleanupPolling(pollingKey) {
+  const pollingData = activePollingIntervals.get(pollingKey);
+  if (pollingData) {
+    clearInterval(pollingData.interval);
+    activePollingIntervals.delete(pollingKey);
+
+    logger.info("Force cleanup of polling operation", {
+      pollingKey,
+      npub: pollingData.npub,
+      quoteId: pollingData.quoteId,
+      transactionId: pollingData.transactionId,
+    });
+
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Cleanup all active polling operations (for shutdown)
+ */
+export function cleanupAllPolling() {
+  const activeCount = activePollingIntervals.size;
+
+  for (const [key, data] of activePollingIntervals.entries()) {
+    clearInterval(data.interval);
+  }
+
+  activePollingIntervals.clear();
+
+  logger.info("Cleaned up all active polling operations", {
+    cleanedCount: activeCount,
+  });
 }

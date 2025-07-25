@@ -829,15 +829,83 @@ export const getTransactionHistory = asyncHandler(async (req, res) => {
       }
     );
 
-    logger.info("Successfully retrieved transaction history", {
+    // DEBUG: Add validation logging to identify invalid records
+    const invalidRecords = [];
+    const validTransactions = historyResult.transactions.filter((tx, index) => {
+      const issues = [];
+
+      // Check for undefined/null required fields
+      if (!tx.npub) issues.push("missing_npub");
+      if (!tx.transaction_id) issues.push("missing_transaction_id");
+      if (!tx.transaction_type) issues.push("missing_transaction_type");
+      if (tx.total_amount === undefined || tx.total_amount === null)
+        issues.push("undefined_total_amount");
+      if (!tx.status) issues.push("missing_status");
+      if (!tx.mint_url) issues.push("missing_mint_url");
+
+      // Check for invalid metadata structure
+      if (!tx.metadata || typeof tx.metadata !== "object")
+        issues.push("invalid_metadata");
+      else if (!tx.metadata.source) issues.push("missing_metadata_source");
+
+      // Check for pending transactions with empty proofs but no total_amount
+      if (
+        tx.status === "pending" &&
+        (!tx.proofs || tx.proofs.length === 0) &&
+        tx.total_amount > 0
+      ) {
+        issues.push("pending_with_amount_but_no_proofs");
+      }
+
+      if (issues.length > 0) {
+        invalidRecords.push({
+          index,
+          transaction_id: tx.transaction_id || "unknown",
+          status: tx.status || "unknown",
+          transaction_type: tx.transaction_type || "unknown",
+          total_amount: tx.total_amount,
+          proofs_count: tx.proofs ? tx.proofs.length : 0,
+          issues,
+        });
+        return false; // Filter out invalid record
+      }
+
+      return true; // Keep valid record
+    });
+
+    // Log validation results
+    if (invalidRecords.length > 0) {
+      logger.warn("Found invalid transaction records", {
+        npub,
+        totalRecords: historyResult.transactions.length,
+        invalidCount: invalidRecords.length,
+        validCount: validTransactions.length,
+        invalidRecords: invalidRecords.slice(0, 5), // Log first 5 invalid records
+      });
+    }
+
+    logger.info("Successfully retrieved and validated transaction history", {
       npub,
-      transactionCount: historyResult.transactions.length,
+      originalCount: historyResult.transactions.length,
+      validCount: validTransactions.length,
+      filteredCount: invalidRecords.length,
       totalTransactions: historyResult.pagination.total,
     });
 
     res.json({
       success: true,
-      ...historyResult,
+      transactions: validTransactions,
+      pagination: {
+        ...historyResult.pagination,
+        filtered_invalid: invalidRecords.length,
+      },
+      debug: {
+        validation_summary: {
+          total_retrieved: historyResult.transactions.length,
+          valid_returned: validTransactions.length,
+          invalid_filtered: invalidRecords.length,
+        },
+      },
     });
   } catch (error) {
     logger.error("Failed to get transaction history", {

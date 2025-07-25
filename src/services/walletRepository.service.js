@@ -320,21 +320,55 @@ class WalletRepositoryService {
    */
   async calculateBalance(npub, mintUrl = null) {
     try {
-      const [unspentBalance, pendingBalance, totalBalance] = await Promise.all([
+      console.log(
+        `[calculateBalance] Starting balance calculation for npub: ${npub}, mintUrl: ${mintUrl}`
+      );
+
+      const [unspentBalance, pendingBalance, spentBalance] = await Promise.all([
         CashuToken.calculateBalance(npub, "unspent", mintUrl),
         CashuToken.calculateBalance(npub, "pending", mintUrl),
-        CashuToken.calculateBalance(npub, null, mintUrl), // All statuses
+        CashuToken.calculateBalance(npub, "spent", mintUrl),
       ]);
 
-      const spentBalance = totalBalance - unspentBalance - pendingBalance;
+      // Calculate total balance as sum of unspent and pending (excluding empty pending transactions)
+      // Spent balance represents tokens that have been used and should not contribute to available balance
+      const totalBalance = unspentBalance + pendingBalance;
 
-      return {
-        total_balance: totalBalance,
+      console.log(`[calculateBalance] Balance breakdown:`, {
+        npub,
+        mintUrl,
         unspent_balance: unspentBalance,
         pending_balance: pendingBalance,
         spent_balance: spentBalance,
+        total_balance: totalBalance,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Validate that balances are not negative
+      if (unspentBalance < 0 || pendingBalance < 0 || spentBalance < 0) {
+        console.error(`[calculateBalance] Negative balance detected:`, {
+          npub,
+          mintUrl,
+          unspent_balance: unspentBalance,
+          pending_balance: pendingBalance,
+          spent_balance: spentBalance,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      return {
+        total_balance: Math.max(0, totalBalance), // Ensure non-negative
+        unspent_balance: Math.max(0, unspentBalance),
+        pending_balance: Math.max(0, pendingBalance),
+        spent_balance: Math.max(0, spentBalance),
       };
     } catch (error) {
+      console.error(`[calculateBalance] Failed to calculate balance:`, {
+        npub,
+        mintUrl,
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      });
       throw new Error(`Failed to calculate balance: ${error.message}`);
     }
   }
@@ -398,14 +432,83 @@ class WalletRepositoryService {
       if (transaction_type) query.transaction_type = transaction_type;
       if (mint_url) query.mint_url = mint_url;
 
-      const [transactions, totalCount] = await Promise.all([
-        CashuToken.find(query)
+      // Enhanced query to filter out invalid records at database level
+      const enhancedQuery = {
+        ...query,
+        // Ensure required fields exist and are not null/undefined
+        transaction_id: { $exists: true, $ne: null, $ne: "" },
+        transaction_type: { $exists: true, $ne: null },
+        status: { $exists: true, $ne: null },
+        mint_url: { $exists: true, $ne: null, $ne: "" },
+        total_amount: { $exists: true, $ne: null, $gte: 0 },
+        "metadata.source": { $exists: true, $ne: null },
+        // Filter out corrupted pending transactions
+        $or: [
+          // Non-pending transactions must have positive total_amount
+          {
+            status: { $ne: "pending" },
+            total_amount: { $gt: 0 },
+          },
+          // Pending transactions can have 0 total_amount and must have either quote_id or be properly structured
+          {
+            status: "pending",
+            total_amount: { $gte: 0 },
+            $or: [
+              { "metadata.quote_id": { $exists: true, $ne: null } },
+              { "metadata.pending_amount": { $exists: true, $ne: null } },
+              { "metadata.mint_amount": { $exists: true, $ne: null } },
+            ],
+          },
+        ],
+      };
+
+      console.log(
+        `[getTransactionHistory] Enhanced query for data integrity:`,
+        {
+          npub,
+          originalQuery: query,
+          enhancedQuery,
+          timestamp: new Date().toISOString(),
+        }
+      );
+
+      const [transactions, totalCount, invalidCount] = await Promise.all([
+        CashuToken.find(enhancedQuery)
           .sort({ created_at: -1 })
           .limit(limit)
           .skip(skip)
           .lean(),
-        CashuToken.countDocuments(query),
+        CashuToken.countDocuments(enhancedQuery),
+        // Count invalid records for monitoring
+        CashuToken.countDocuments({
+          ...query,
+          $or: [
+            { transaction_id: { $exists: false } },
+            { transaction_id: null },
+            { transaction_id: "" },
+            { transaction_type: { $exists: false } },
+            { transaction_type: null },
+            { status: { $exists: false } },
+            { status: null },
+            { total_amount: { $exists: false } },
+            { total_amount: null },
+            { total_amount: { $lt: 0 } },
+            { "metadata.source": { $exists: false } },
+            { "metadata.source": null },
+          ],
+        }),
       ]);
+
+      // Log data integrity metrics
+      if (invalidCount > 0) {
+        console.warn(`[getTransactionHistory] Found invalid records:`, {
+          npub,
+          validCount: totalCount,
+          invalidCount,
+          totalInDb: totalCount + invalidCount,
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       return {
         transactions,
@@ -414,6 +517,7 @@ class WalletRepositoryService {
           limit,
           skip,
           has_more: skip + limit < totalCount,
+          invalid_filtered: invalidCount,
         },
       };
     } catch (error) {

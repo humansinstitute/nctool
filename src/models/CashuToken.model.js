@@ -120,7 +120,7 @@ const CashuTokenSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["unspent", "spent", "pending"],
+      enum: ["unspent", "spent", "pending", "failed"],
       default: "unspent",
       required: true,
     },
@@ -135,30 +135,14 @@ const CashuTokenSchema = new mongoose.Schema(
       trim: true,
     },
     metadata: {
-      source: {
-        type: String,
-        enum: ["lightning", "p2p", "mint", "change"],
-        required: true,
-      },
-      encoded_token: {
-        type: String,
-        trim: true,
-        // Original encoded token if received from another user
-      },
-      lightning_invoice: {
-        type: String,
-        trim: true,
-        // Lightning invoice if minted from Lightning payment
-      },
-      recipient_info: {
-        type: String,
-        trim: true,
-        // Information about recipient if sent to someone
-      },
-      parent_transaction_id: {
-        type: String,
-        trim: true,
-        // Reference to parent transaction for change tokens
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+      validate: {
+        validator: function (v) {
+          // Ensure metadata is an object and has required source field
+          return v && typeof v === "object" && v.source;
+        },
+        message: "Metadata must be an object with a source field",
       },
     },
     spent_at: {
@@ -200,9 +184,15 @@ CashuTokenSchema.pre("save", function (next) {
   }
 
   // Status-dependent validation for total_amount
-  if (this.status !== "pending" && this.total_amount <= 0) {
+  if (
+    this.status !== "pending" &&
+    this.status !== "failed" &&
+    this.total_amount <= 0
+  ) {
     return next(
-      new Error("Total amount must be positive for non-pending transactions")
+      new Error(
+        "Total amount must be positive for non-pending, non-failed transactions"
+      )
     );
   }
 
@@ -222,15 +212,20 @@ CashuTokenSchema.pre(
   function (next) {
     const update = this.getUpdate();
 
-    // If status is being updated to non-pending and total_amount is 0 or negative, prevent the update
-    if (update.$set && update.$set.status && update.$set.status !== "pending") {
+    // If status is being updated to non-pending, non-failed and total_amount is 0 or negative, prevent the update
+    if (
+      update.$set &&
+      update.$set.status &&
+      update.$set.status !== "pending" &&
+      update.$set.status !== "failed"
+    ) {
       if (
         update.$set.total_amount !== undefined &&
         update.$set.total_amount <= 0
       ) {
         return next(
           new Error(
-            "Total amount must be positive for non-pending transactions"
+            "Total amount must be positive for non-pending, non-failed transactions"
           )
         );
       }
@@ -302,17 +297,60 @@ CashuTokenSchema.statics.calculateBalance = async function (
   status = "unspent",
   mintUrl = null
 ) {
-  const query = { npub, status };
+  const query = { npub };
+  if (status) {
+    query.status = status;
+  }
   if (mintUrl) {
     query.mint_url = mintUrl;
   }
 
-  const result = await this.aggregate([
-    { $match: query },
-    { $group: { _id: null, total: { $sum: "$total_amount" } } },
-  ]);
+  console.log(`[CashuToken.calculateBalance] Starting calculation:`, {
+    npub,
+    status,
+    mintUrl,
+    query,
+    timestamp: new Date().toISOString(),
+  });
 
-  return result.length > 0 ? result[0].total : 0;
+  const pipeline = [
+    { $match: query },
+    {
+      $match: {
+        $or: [
+          // Include all non-pending transactions
+          { status: { $ne: "pending" } },
+          // Include pending transactions only if they have proofs (non-empty array)
+          {
+            status: "pending",
+            proofs: { $exists: true, $not: { $size: 0 } },
+          },
+        ],
+      },
+    },
+    { $group: { _id: null, total: { $sum: "$total_amount" } } },
+  ];
+
+  console.log(`[CashuToken.calculateBalance] Aggregation pipeline:`, {
+    npub,
+    status,
+    pipeline: JSON.stringify(pipeline),
+    timestamp: new Date().toISOString(),
+  });
+
+  const result = await this.aggregate(pipeline);
+  const balance = result.length > 0 ? result[0].total : 0;
+
+  console.log(`[CashuToken.calculateBalance] Result:`, {
+    npub,
+    status,
+    mintUrl,
+    balance,
+    resultCount: result.length,
+    timestamp: new Date().toISOString(),
+  });
+
+  return balance;
 };
 
 /**
