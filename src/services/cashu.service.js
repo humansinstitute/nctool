@@ -459,6 +459,9 @@ export async function initializeWallet(npub, testConnectivity = false) {
       unit: walletDoc.wallet_config?.unit || "sat",
     });
 
+    // Load mint keysets - CRITICAL FIX for Lightning Melt operations
+    await wallet.loadMint();
+
     // Validate wallet initialization
     if (!wallet || typeof wallet.createMintQuote !== "function") {
       throw new Error(
@@ -471,6 +474,7 @@ export async function initializeWallet(npub, testConnectivity = false) {
       mintUrl: MINT_URL,
       walletId: walletDoc._id,
       hasConnectivityTest: !!connectivityTestResult,
+      keysets: wallet.keysets?.length || 0, // Verify keysets loaded
     });
 
     const result = { wallet, walletDoc, mint };
@@ -1092,19 +1096,87 @@ export async function meltTokens(npub, invoice) {
       MINT_URL
     );
 
+    logger.info("Token selection debug", {
+      npub,
+      totalNeeded,
+      selectedTokensCount: selection.selected_tokens.length,
+      totalSelected: selection.total_selected,
+      changeAmount: selection.change_amount,
+    });
+
     // Collect all proofs from selected tokens
     const allProofs = [];
     const tokenIds = [];
 
     for (const token of selection.selected_tokens) {
-      allProofs.push(...token.proofs);
+      logger.info("Processing token", {
+        tokenId: token._id,
+        totalAmount: token.total_amount,
+        proofsCount: token.proofs?.length || 0,
+        status: token.status,
+      });
+
+      // ✅ Convert Mongoose documents to plain objects before passing to Cashu-ts
+      const plainProofs = token.proofs.map((proof) =>
+        proof.toObject ? proof.toObject() : proof
+      );
+      allProofs.push(...plainProofs);
       tokenIds.push(token._id);
     }
 
-    // Send the required amount for melting
-    const { send, keep } = await wallet.send(totalNeeded, allProofs, {
-      includeFees: true,
+    logger.info("All proofs collected", {
+      allProofsCount: allProofs.length,
+      totalAmount: allProofs.reduce((sum, p) => sum + (p.amount || 0), 0),
     });
+
+    // ADD THESE DETAILED LOGS:
+    logger.info("Detailed proof inspection", {
+      proofsStructure: allProofs.map((p) => ({
+        hasId: !!p.id,
+        hasAmount: !!p.amount,
+        hasSecret: !!p.secret,
+        hasC: !!p.C,
+        id: p.id?.substring(0, 10) + "...",
+        amount: p.amount,
+        secretLength: p.secret?.length,
+        CLength: p.C?.length,
+        allKeys: Object.keys(p),
+      })),
+    });
+
+    // Also log before wallet.send call:
+    logger.info("About to call wallet.send", {
+      totalNeeded,
+      allProofsCount: allProofs.length,
+      walletHasKeys: wallet.keys?.size || 0,
+      walletKeysets: wallet.keysets?.length || 0,
+    });
+
+    // Send the required amount for melting with enhanced error handling
+    let send, keep;
+    try {
+      logger.info("Calling wallet.send", {
+        totalNeeded,
+        proofsCount: allProofs.length,
+      });
+      const result = await wallet.send(totalNeeded, allProofs, {
+        includeFees: true,
+      });
+      send = result.send;
+      keep = result.keep;
+      logger.info("wallet.send successful", {
+        sendProofs: send.length,
+        keepProofs: keep.length,
+      });
+    } catch (sendError) {
+      logger.error("wallet.send failed", {
+        error: sendError.message,
+        errorName: sendError.name,
+        errorCode: sendError.code,
+        stack: sendError.stack?.split("\n").slice(0, 5),
+      });
+      throw sendError;
+    }
 
     // Execute the melt operation
     const meltResponse = await wallet.meltProofs(meltQuote, send);
