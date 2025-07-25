@@ -3,10 +3,106 @@ import { getPublicKey, nip19, nip04 } from "nostr-tools";
 import { CashuMint, CashuWallet, getEncodedToken } from "@cashu/cashu-ts";
 import walletRepositoryService from "./walletRepository.service.js";
 import { logger } from "../utils/logger.js";
+import https from "https";
+import fetch from "node-fetch";
 
-// Initialize mint instance
+// Mint configuration
 const MINT_URL = process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
-const mint = new CashuMint(MINT_URL);
+
+/**
+ * Create a custom HTTPS agent that works with the mint server
+ * This fixes Node.js connectivity issues with the mint server
+ */
+function createMintAgent() {
+  return new https.Agent({
+    // Force IPv4 to avoid IPv6 routing issues
+    family: 4,
+
+    // Enable keep-alive for better connection reuse
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+
+    // Set reasonable timeouts
+    timeout: 30000,
+
+    // Allow more concurrent connections
+    maxSockets: 10,
+    maxFreeSockets: 5,
+
+    // Handle TLS properly
+    rejectUnauthorized: true,
+
+    // Set socket timeout
+    socketTimeout: 30000,
+
+    // Enable TCP keep-alive
+    keepAliveInitialDelay: 0,
+  });
+}
+
+/**
+ * Configure fetch with the custom agent for mint connectivity
+ */
+export function createMintFetch() {
+  const agent = createMintAgent();
+
+  return (url, options = {}) => {
+    return fetch(url, {
+      ...options,
+      agent: agent,
+      timeout: 30000,
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "nctool/1.0",
+        ...options.headers,
+      },
+    });
+  };
+}
+
+// Create the custom fetch instance for mint operations
+const mintFetch = createMintFetch();
+
+/**
+ * Patch global fetch to use our custom HTTPS agent for Cashu library compatibility
+ * This ensures the Cashu library uses our connectivity fixes
+ */
+function patchGlobalFetch() {
+  const originalFetch = global.fetch;
+
+  // Store reference to node-fetch if it exists
+  if (!originalFetch && typeof fetch !== "undefined") {
+    global.fetch = fetch;
+  }
+
+  // Override global fetch with our custom implementation
+  global.fetch = (url, options = {}) => {
+    // Use our custom fetch for mint URLs
+    if (
+      typeof url === "string" &&
+      (url.includes("mint.minibits.cash") ||
+        url.includes("testnut.cashu.space"))
+    ) {
+      logger.debug("Using custom fetch for mint URL", {
+        url: url.substring(0, 50),
+      });
+      return mintFetch(url, options);
+    }
+
+    // Use original fetch for other URLs
+    if (originalFetch) {
+      return originalFetch(url, options);
+    }
+
+    // Fallback to node-fetch
+    return fetch(url, options);
+  };
+
+  logger.info("Global fetch patched for Cashu library compatibility");
+}
+
+// Apply the patch immediately
+patchGlobalFetch();
 
 /**
  * Generates a P2PK keypair for an eCash wallet.
@@ -95,16 +191,245 @@ export async function getWalletDetails(npub, nsec, ndk) {
   }
 }
 
+/**
+ * Test mint connectivity with comprehensive diagnostics
+ * @param {string} mintUrl - Mint URL to test
+ * @returns {Promise<Object>} Connectivity test results
+ */
+async function testMintConnectivity(mintUrl) {
+  const testResults = {
+    mintUrl,
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version,
+    platform: process.platform,
+    tests: {
+      httpConnectivity: { success: false, error: null, duration: 0 },
+      mintInfo: { success: false, error: null, duration: 0, data: null },
+      cashuLibrary: { success: false, error: null, duration: 0 },
+    },
+    overall: { success: false, error: null },
+  };
+
+  try {
+    logger.info("Starting comprehensive mint connectivity test", { mintUrl });
+
+    // Test 1: Basic HTTP connectivity
+    const httpStart = Date.now();
+    try {
+      const response = await mintFetch(`${mintUrl}/v1/info`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+        timeout: 10000,
+      });
+
+      testResults.tests.httpConnectivity.duration = Date.now() - httpStart;
+
+      if (response.ok) {
+        testResults.tests.httpConnectivity.success = true;
+        logger.debug("HTTP connectivity test passed", {
+          mintUrl,
+          status: response.status,
+          duration: testResults.tests.httpConnectivity.duration,
+        });
+      } else {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+    } catch (error) {
+      testResults.tests.httpConnectivity.duration = Date.now() - httpStart;
+      testResults.tests.httpConnectivity.error = {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        cause: error.cause,
+      };
+      logger.warn("HTTP connectivity test failed", {
+        mintUrl,
+        error: error.message,
+        duration: testResults.tests.httpConnectivity.duration,
+      });
+    }
+
+    // Test 2: Mint info retrieval
+    const infoStart = Date.now();
+    try {
+      const mint = new CashuMint(mintUrl);
+      const info = await mint.getInfo();
+
+      testResults.tests.mintInfo.duration = Date.now() - infoStart;
+      testResults.tests.mintInfo.success = true;
+      testResults.tests.mintInfo.data = {
+        name: info.name,
+        version: info.version,
+        description: info.description,
+        nuts: Object.keys(info.nuts || {}),
+      };
+
+      logger.debug("Mint info test passed", {
+        mintUrl,
+        mintName: info.name,
+        duration: testResults.tests.mintInfo.duration,
+      });
+    } catch (error) {
+      testResults.tests.mintInfo.duration = Date.now() - infoStart;
+      testResults.tests.mintInfo.error = {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        cause: error.cause,
+        stack: error.stack?.split("\n").slice(0, 3),
+      };
+      logger.warn("Mint info test failed", {
+        mintUrl,
+        error: error.message,
+        duration: testResults.tests.mintInfo.duration,
+      });
+    }
+
+    // Test 3: Cashu library initialization
+    const libStart = Date.now();
+    try {
+      const mint = new CashuMint(mintUrl);
+      const wallet = new CashuWallet(mint, { unit: "sat" });
+
+      // Test basic wallet functionality
+      if (wallet && typeof wallet.createMintQuote === "function") {
+        testResults.tests.cashuLibrary.duration = Date.now() - libStart;
+        testResults.tests.cashuLibrary.success = true;
+        logger.debug("Cashu library test passed", {
+          mintUrl,
+          duration: testResults.tests.cashuLibrary.duration,
+        });
+      } else {
+        throw new Error(
+          "Wallet initialization succeeded but missing expected methods"
+        );
+      }
+    } catch (error) {
+      testResults.tests.cashuLibrary.duration = Date.now() - libStart;
+      testResults.tests.cashuLibrary.error = {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        cause: error.cause,
+        stack: error.stack?.split("\n").slice(0, 3),
+      };
+      logger.warn("Cashu library test failed", {
+        mintUrl,
+        error: error.message,
+        duration: testResults.tests.cashuLibrary.duration,
+      });
+    }
+
+    // Determine overall success
+    const allTests = Object.values(testResults.tests);
+    const successfulTests = allTests.filter((test) => test.success).length;
+    const totalTests = allTests.length;
+
+    testResults.overall.success = successfulTests === totalTests;
+
+    if (!testResults.overall.success) {
+      const failedTests = allTests.filter((test) => !test.success);
+      testResults.overall.error = `${
+        failedTests.length
+      }/${totalTests} tests failed: ${failedTests
+        .map((test) =>
+          Object.keys(testResults.tests).find(
+            (key) => testResults.tests[key] === test
+          )
+        )
+        .join(", ")}`;
+    }
+
+    logger.info("Mint connectivity test completed", {
+      mintUrl,
+      success: testResults.overall.success,
+      successfulTests: `${successfulTests}/${totalTests}`,
+      totalDuration: allTests.reduce((sum, test) => sum + test.duration, 0),
+    });
+
+    return testResults;
+  } catch (error) {
+    testResults.overall.error = {
+      name: error.name,
+      message: error.message,
+      code: error.code,
+      cause: error.cause,
+      stack: error.stack?.split("\n").slice(0, 5),
+    };
+
+    logger.error("Mint connectivity test failed with unexpected error", {
+      mintUrl,
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return testResults;
+  }
+}
+
 // ==================== ENHANCED CASHU SERVICE LAYER ====================
 
 /**
- * Initialize a CashuWallet instance for a user
+ * Initialize a CashuWallet instance for a user with enhanced connectivity testing
  * @param {string} npub - User's Nostr npub string
- * @returns {Promise<CashuWallet>} Initialized wallet instance
+ * @param {boolean} [testConnectivity=false] - Whether to run connectivity tests
+ * @returns {Promise<{wallet: CashuWallet, walletDoc: Object, mint: CashuMint, connectivityTest?: Object}>} Initialized wallet instance and components
  */
-async function initializeWallet(npub) {
+export async function initializeWallet(npub, testConnectivity = false) {
   try {
-    logger.info("Initializing Cashu wallet", { npub, mintUrl: MINT_URL });
+    logger.info("Initializing Cashu wallet with per-request mint", {
+      npub,
+      mintUrl: MINT_URL,
+      testConnectivity,
+    });
+
+    let connectivityTestResult = null;
+
+    // Run connectivity test if requested
+    if (testConnectivity) {
+      logger.info("Running mint connectivity test", {
+        npub,
+        mintUrl: MINT_URL,
+      });
+      connectivityTestResult = await testMintConnectivity(MINT_URL);
+
+      if (!connectivityTestResult.overall.success) {
+        const error = new Error(
+          `Mint connectivity test failed: ${connectivityTestResult.overall.error}`
+        );
+        error.connectivityTest = connectivityTestResult;
+        throw error;
+      }
+
+      logger.info("Mint connectivity test passed", {
+        npub,
+        mintUrl: MINT_URL,
+        successfulTests: Object.values(connectivityTestResult.tests).filter(
+          (t) => t.success
+        ).length,
+      });
+    }
+
+    // Create fresh mint instance per request (no global state)
+    const mint = new CashuMint(MINT_URL);
+
+    // Test basic mint functionality
+    try {
+      await mint.getInfo();
+      logger.debug("Mint info retrieval successful", {
+        npub,
+        mintUrl: MINT_URL,
+      });
+    } catch (mintError) {
+      logger.error("Failed to retrieve mint info during initialization", {
+        npub,
+        mintUrl: MINT_URL,
+        error: mintError.message,
+        errorName: mintError.name,
+        errorCode: mintError.code,
+      });
+      throw new Error(`Mint not accessible: ${mintError.message}`);
+    }
 
     // Find or create wallet in database
     let walletDoc = await walletRepositoryService.findWallet(npub, MINT_URL);
@@ -129,46 +454,187 @@ async function initializeWallet(npub) {
       });
     }
 
-    // Initialize CashuWallet instance
+    // Initialize CashuWallet instance with fresh mint
     const wallet = new CashuWallet(mint, {
       unit: walletDoc.wallet_config?.unit || "sat",
     });
 
+    // Validate wallet initialization
+    if (!wallet || typeof wallet.createMintQuote !== "function") {
+      throw new Error(
+        "Wallet initialization failed - missing required methods"
+      );
+    }
+
     logger.info("Cashu wallet initialized successfully", {
       npub,
       mintUrl: MINT_URL,
+      walletId: walletDoc._id,
+      hasConnectivityTest: !!connectivityTestResult,
     });
-    return { wallet, walletDoc };
+
+    const result = { wallet, walletDoc, mint };
+    if (connectivityTestResult) {
+      result.connectivityTest = connectivityTestResult;
+    }
+
+    return result;
   } catch (error) {
-    logger.error("Failed to initialize Cashu wallet", {
+    // Enhanced error logging with environment details
+    const errorDetails = {
       npub,
       mintUrl: MINT_URL,
-      error: error.message,
-    });
-    throw new Error(`Failed to initialize wallet: ${error.message}`);
+      error: {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        cause: error.cause,
+        stack: error.stack?.split("\n").slice(0, 5),
+      },
+      environment: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        timestamp: new Date().toISOString(),
+      },
+      connectivityTest: error.connectivityTest || null,
+    };
+
+    logger.error("Failed to initialize Cashu wallet", errorDetails);
+
+    // Preserve connectivity test data in error
+    const enhancedError = new Error(
+      `Failed to initialize wallet: ${error.message}`
+    );
+    if (error.connectivityTest) {
+      enhancedError.connectivityTest = error.connectivityTest;
+    }
+
+    throw enhancedError;
   }
 }
 
 /**
- * Create mint quote and mint tokens from Lightning
+ * Create mint quote and mint tokens from Lightning with enhanced error diagnostics
  * @param {string} npub - User's Nostr npub string
  * @param {number} amount - Amount to mint in satoshis
+ * @param {boolean} [testConnectivity=false] - Whether to run connectivity tests on failure
  * @returns {Promise<Object>} Mint result with quote and proofs
  */
-export async function mintTokens(npub, amount) {
+export async function mintTokens(npub, amount, testConnectivity = false) {
+  const operationStart = Date.now();
+
   try {
-    logger.info("Starting mint tokens operation", { npub, amount });
-
-    const { wallet, walletDoc } = await initializeWallet(npub);
-
-    // Create mint quote
-    const mintQuote = await wallet.createMintQuote(amount);
-    logger.info("Created mint quote", {
+    logger.info("Starting enhanced mint tokens operation", {
       npub,
       amount,
-      quoteId: mintQuote.quote,
-      invoice: mintQuote.request,
+      testConnectivity,
+      timestamp: new Date().toISOString(),
     });
+
+    // Initialize wallet with optional connectivity testing
+    const { wallet, walletDoc, mint } = await initializeWallet(
+      npub,
+      testConnectivity
+    );
+
+    logger.info("Wallet initialized successfully, creating mint quote", {
+      npub,
+      amount,
+      mintUrl: MINT_URL,
+      walletId: walletDoc._id,
+    });
+
+    // Create mint quote with comprehensive error handling
+    let mintQuote;
+    try {
+      const quoteStart = Date.now();
+      mintQuote = await wallet.createMintQuote(amount);
+      const quoteDuration = Date.now() - quoteStart;
+
+      logger.info("Created mint quote successfully", {
+        npub,
+        amount,
+        quoteId: mintQuote.quote,
+        invoice: mintQuote.request,
+        quoteDuration,
+        expiry: mintQuote.expiry,
+      });
+    } catch (quoteError) {
+      // Enhanced error logging for mint quote creation failure
+      const errorDetails = {
+        npub,
+        amount,
+        mintUrl: MINT_URL,
+        operation: "createMintQuote",
+        error: {
+          name: quoteError.name,
+          message: quoteError.message,
+          code: quoteError.code,
+          cause: quoteError.cause,
+          stack: quoteError.stack?.split("\n").slice(0, 10),
+        },
+        environment: {
+          nodeVersion: process.version,
+          platform: process.platform,
+          arch: process.arch,
+          timestamp: new Date().toISOString(),
+          operationDuration: Date.now() - operationStart,
+        },
+        walletState: {
+          walletId: walletDoc._id,
+          hasWallet: !!wallet,
+          hasMint: !!mint,
+          walletMethods: wallet
+            ? Object.getOwnPropertyNames(Object.getPrototypeOf(wallet))
+            : null,
+        },
+      };
+
+      logger.error(
+        "CRITICAL: Mint quote creation failed - this is the reported issue",
+        errorDetails
+      );
+
+      // If connectivity testing wasn't done initially and this is the main error, run it now
+      if (!testConnectivity) {
+        logger.info(
+          "Running connectivity test to diagnose mint quote failure",
+          { npub, amount }
+        );
+        try {
+          const connectivityTest = await testMintConnectivity(MINT_URL);
+          errorDetails.connectivityTest = connectivityTest;
+
+          logger.error("Connectivity test results for failed mint quote", {
+            npub,
+            amount,
+            connectivityTest: {
+              overall: connectivityTest.overall,
+              httpConnectivity: connectivityTest.tests.httpConnectivity.success,
+              mintInfo: connectivityTest.tests.mintInfo.success,
+              cashuLibrary: connectivityTest.tests.cashuLibrary.success,
+            },
+          });
+        } catch (connectivityError) {
+          logger.error("Connectivity test also failed", {
+            npub,
+            amount,
+            connectivityError: connectivityError.message,
+          });
+          errorDetails.connectivityTestError = connectivityError.message;
+        }
+      }
+
+      // Create enhanced error with all diagnostic information
+      const enhancedError = new Error(
+        `Failed to create mint quote: ${quoteError.message}`
+      );
+      enhancedError.diagnostics = errorDetails;
+      enhancedError.originalError = quoteError;
+
+      throw enhancedError;
+    }
 
     // Generate transaction ID
     const transactionId = walletRepositoryService.generateTransactionId("mint");
@@ -211,6 +677,15 @@ export async function mintTokens(npub, amount) {
       pollingInterval: "10 seconds",
     });
 
+    const operationDuration = Date.now() - operationStart;
+    logger.info("Mint tokens operation completed successfully", {
+      npub,
+      amount,
+      transactionId,
+      quoteId: mintQuote.quote,
+      operationDuration,
+    });
+
     return {
       quote: mintQuote.quote,
       invoice: mintQuote.request,
@@ -220,12 +695,41 @@ export async function mintTokens(npub, amount) {
       mintUrl: MINT_URL,
     };
   } catch (error) {
-    logger.error("Failed to create mint quote", {
+    const operationDuration = Date.now() - operationStart;
+
+    // Enhanced error logging for any other failures
+    const errorContext = {
       npub,
       amount,
-      error: error.message,
-    });
-    throw new Error(`Failed to mint tokens: ${error.message}`);
+      testConnectivity,
+      operationDuration,
+      error: {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        cause: error.cause,
+        stack: error.stack?.split("\n").slice(0, 5),
+      },
+      environment: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        timestamp: new Date().toISOString(),
+      },
+      diagnostics: error.diagnostics || null,
+    };
+
+    logger.error("Enhanced mint tokens operation failed", errorContext);
+
+    // Preserve diagnostic information in the thrown error
+    const enhancedError = new Error(`Failed to mint tokens: ${error.message}`);
+    if (error.diagnostics) {
+      enhancedError.diagnostics = error.diagnostics;
+    }
+    if (error.originalError) {
+      enhancedError.originalError = error.originalError;
+    }
+
+    throw enhancedError;
   }
 }
 
@@ -1027,15 +1531,15 @@ async function checkQuoteStatusWithRetry(npub, quoteId, maxRetries = 3) {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      logger.debug("Checking quote status", {
+      logger.debug("Checking quote status with per-request initialization", {
         npub,
         quoteId,
         attempt,
         maxRetries,
       });
 
-      // Initialize wallet with timeout handling
-      const { wallet } = await initializeWallet(npub);
+      // Initialize wallet with fresh mint instance (no connectivity test for polling)
+      const { wallet } = await initializeWallet(npub, false);
       const status = await wallet.checkMintQuote(quoteId);
 
       logger.debug("Quote status check successful", {
@@ -1052,7 +1556,11 @@ async function checkQuoteStatusWithRetry(npub, quoteId, maxRetries = 3) {
         quoteId,
         attempt,
         maxRetries,
-        error: error.message,
+        error: {
+          name: error.name,
+          message: error.message,
+          code: error.code,
+        },
         willRetry: attempt < maxRetries,
       });
 
@@ -1064,9 +1572,15 @@ async function checkQuoteStatusWithRetry(npub, quoteId, maxRetries = 3) {
     }
   }
 
-  throw new Error(
+  // Enhanced error for final failure
+  const enhancedError = new Error(
     `Failed to check quote status after ${maxRetries} attempts: ${lastError.message}`
   );
+  enhancedError.originalError = lastError;
+  enhancedError.attempts = maxRetries;
+  enhancedError.quoteId = quoteId;
+
+  throw enhancedError;
 }
 
 /**
@@ -1187,4 +1701,12 @@ export function cleanupAllPolling() {
   logger.info("Cleaned up all active polling operations", {
     cleanedCount: activeCount,
   });
+}
+
+/**
+ * Test mint connectivity - exported for external use
+ * @returns {Promise<Object>} Comprehensive connectivity test results
+ */
+export async function testMintConnectivityExternal(mintUrl = MINT_URL) {
+  return await testMintConnectivity(mintUrl);
 }

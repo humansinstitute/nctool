@@ -162,8 +162,7 @@ class ValidationService {
    */
   static async validateWalletExists(npub) {
     try {
-      const MINT_URL =
-        process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
+      const MINT_URL = process.env.MINT_URL || "https://testnut.cashu.space";
       const wallet = await walletRepositoryService.findWallet(npub, MINT_URL);
 
       if (!wallet) {
