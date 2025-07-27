@@ -1063,17 +1063,48 @@ export async function receiveTokens(npub, encodedToken, privateKey = null) {
 }
 
 /**
- * Pay Lightning invoice with tokens (melt operation)
+ * Pay Lightning invoice with tokens (melt operation) with atomic transactions and state consistency
  * @param {string} npub - User's Nostr npub string
  * @param {string} invoice - Lightning invoice to pay
  * @returns {Promise<Object>} Payment result and change information
  */
 export async function meltTokens(npub, invoice) {
   try {
-    logger.info("Starting melt tokens operation", {
+    logger.info(
+      "Starting atomic melt tokens operation with state consistency",
+      {
+        npub,
+        invoice: invoice.substring(0, 50) + "...",
+      }
+    );
+
+    // Step 1: Run state reconciliation before operation to ensure consistency
+    logger.info("Running proof state reconciliation before melt operation", {
       npub,
-      invoice: invoice.substring(0, 50) + "...",
     });
+    const reconciliationResult = await reconcileProofStates(npub);
+
+    if (
+      !reconciliationResult.consistent &&
+      reconciliationResult.reconciled === 0
+    ) {
+      logger.warn(
+        "State inconsistencies detected but could not be reconciled",
+        {
+          npub,
+          discrepancies: reconciliationResult.changes.length,
+          errors: reconciliationResult.errors,
+        }
+      );
+
+      // Continue with operation but log the warning
+    } else if (reconciliationResult.reconciled > 0) {
+      logger.info("State reconciliation completed before melt", {
+        npub,
+        reconciled: reconciliationResult.reconciled,
+        nowConsistent: reconciliationResult.consistent,
+      });
+    }
 
     const { wallet, walletDoc } = await initializeWallet(npub);
 
@@ -1096,7 +1127,7 @@ export async function meltTokens(npub, invoice) {
       MINT_URL
     );
 
-    logger.info("Token selection debug", {
+    logger.info("Token selection completed", {
       npub,
       totalNeeded,
       selectedTokensCount: selection.selected_tokens.length,
@@ -1109,14 +1140,14 @@ export async function meltTokens(npub, invoice) {
     const tokenIds = [];
 
     for (const token of selection.selected_tokens) {
-      logger.info("Processing token", {
+      logger.debug("Processing token for melt", {
         tokenId: token._id,
         totalAmount: token.total_amount,
         proofsCount: token.proofs?.length || 0,
         status: token.status,
       });
 
-      // ✅ Convert Mongoose documents to plain objects before passing to Cashu-ts
+      // Convert Mongoose documents to plain objects before passing to Cashu-ts
       const plainProofs = token.proofs.map((proof) =>
         proof.toObject ? proof.toObject() : proof
       );
@@ -1124,144 +1155,196 @@ export async function meltTokens(npub, invoice) {
       tokenIds.push(token._id);
     }
 
-    logger.info("All proofs collected", {
+    // Step 2: Verify proof states BEFORE using them in melt operation
+    logger.info("Verifying proof states before melt operation", { npub });
+    const proofStateCheck = await checkProofStates(npub, allProofs);
+
+    if (!proofStateCheck.consistent) {
+      const criticalIssues = proofStateCheck.discrepancies.filter(
+        (d) => d.severity === "HIGH"
+      );
+
+      if (criticalIssues.length > 0) {
+        logger.error("Critical proof state inconsistencies detected", {
+          npub,
+          criticalIssues: criticalIssues.length,
+          totalDiscrepancies: proofStateCheck.discrepancies.length,
+        });
+
+        throw new Error(
+          `Cannot proceed with melt: ${criticalIssues.length} proofs are already spent on mint but marked as unspent in database. Please run reconciliation first.`
+        );
+      }
+
+      logger.warn(
+        "Non-critical proof state inconsistencies detected, proceeding with caution",
+        {
+          npub,
+          discrepancies: proofStateCheck.discrepancies.length,
+        }
+      );
+    }
+
+    // Check if any proofs are already spent on the mint
+    const spentProofs = proofStateCheck.states.filter((state, index) => {
+      return state.state === "SPENT";
+    });
+
+    if (spentProofs.length > 0) {
+      logger.error("Attempted to use already spent proofs", {
+        npub,
+        spentProofsCount: spentProofs.length,
+        totalProofs: allProofs.length,
+      });
+
+      throw new Error(
+        `Token already spent: ${spentProofs.length} of ${allProofs.length} selected proofs are already spent on the mint. Database state is inconsistent.`
+      );
+    }
+
+    logger.info("All proofs verified as unspent, proceeding with melt", {
+      npub,
       allProofsCount: allProofs.length,
       totalAmount: allProofs.reduce((sum, p) => sum + (p.amount || 0), 0),
-    });
-
-    // ADD THESE DETAILED LOGS:
-    logger.info("Detailed proof inspection", {
-      proofsStructure: allProofs.map((p) => ({
-        hasId: !!p.id,
-        hasAmount: !!p.amount,
-        hasSecret: !!p.secret,
-        hasC: !!p.C,
-        id: p.id?.substring(0, 10) + "...",
-        amount: p.amount,
-        secretLength: p.secret?.length,
-        CLength: p.C?.length,
-        allKeys: Object.keys(p),
-      })),
-    });
-
-    // Also log before wallet.send call:
-    logger.info("About to call wallet.send", {
-      totalNeeded,
-      allProofsCount: allProofs.length,
-      walletHasKeys: wallet.keys?.size || 0,
-      walletKeysets: wallet.keysets?.length || 0,
     });
 
     // Send the required amount for melting with enhanced error handling
     let send, keep;
     try {
-      logger.info("Calling wallet.send", {
+      logger.info("Creating send transaction for melt", {
         totalNeeded,
         proofsCount: allProofs.length,
       });
+
       const result = await wallet.send(totalNeeded, allProofs, {
         includeFees: true,
       });
       send = result.send;
       keep = result.keep;
-      logger.info("wallet.send successful", {
+
+      logger.info("Send transaction created successfully", {
         sendProofs: send.length,
         keepProofs: keep.length,
       });
     } catch (sendError) {
-      logger.error("wallet.send failed", {
+      logger.error("Send transaction failed", {
+        npub,
         error: sendError.message,
         errorName: sendError.name,
         errorCode: sendError.code,
         stack: sendError.stack?.split("\n").slice(0, 5),
       });
-      throw sendError;
+      throw new Error(
+        `Failed to create send transaction: ${sendError.message}`
+      );
     }
 
     // Execute the melt operation
-    const meltResponse = await wallet.meltProofs(meltQuote, send);
+    let meltResponse;
+    try {
+      logger.info("Executing melt operation", {
+        npub,
+        quoteId: meltQuote.quote,
+        sendProofsCount: send.length,
+      });
 
-    logger.info("Successfully melted tokens", {
-      npub,
-      quoteId: meltQuote.quote,
-      paymentResult: meltResponse.state,
-      changeProofs: meltResponse.change?.length || 0,
-    });
+      meltResponse = await wallet.meltProofs(meltQuote, send);
 
-    // Generate transaction ID
+      logger.info("Melt operation completed successfully", {
+        npub,
+        quoteId: meltQuote.quote,
+        paymentResult: meltResponse.state,
+        changeProofs: meltResponse.change?.length || 0,
+      });
+    } catch (meltError) {
+      logger.error("Melt operation failed", {
+        npub,
+        quoteId: meltQuote.quote,
+        error: meltError.message,
+        errorName: meltError.name,
+      });
+      throw new Error(`Melt operation failed: ${meltError.message}`);
+    }
+
+    // Step 3: Execute atomic database operations
     const transactionId = walletRepositoryService.generateTransactionId("melt");
 
-    // Mark spent tokens as spent
-    await walletRepositoryService.markTokensAsSpent(tokenIds);
-
-    // Store melted tokens record for transaction history
-    await walletRepositoryService.storeTokens({
-      npub,
-      wallet_id: walletDoc._id,
-      proofs: send,
-      mint_url: MINT_URL,
-      transaction_type: "melted",
-      transaction_id: transactionId,
-      metadata: {
-        source: "lightning",
-        quote_id: meltQuote.quote,
-        invoice_amount: meltQuote.amount,
-        fee_reserve: meltQuote.fee_reserve,
-        total_amount: totalNeeded,
-      },
-    });
-
-    // Store change tokens (from send operation)
-    if (keep.length > 0) {
-      await walletRepositoryService.storeTokens({
+    try {
+      logger.info("Executing atomic database operations", {
         npub,
-        wallet_id: walletDoc._id,
-        proofs: keep,
-        mint_url: MINT_URL,
-        transaction_type: "change",
-        transaction_id: transactionId,
-        metadata: {
-          source: "change",
-          original_amount: selection.total_selected,
-          melt_amount: totalNeeded,
-          change_from_selection: true,
-        },
+        transactionId,
+        tokenIdsToSpend: tokenIds.length,
       });
-    }
 
-    // Store change tokens from melt operation if any
-    if (meltResponse.change && meltResponse.change.length > 0) {
-      await walletRepositoryService.storeTokens({
+      const atomicResult = await walletRepositoryService.executeAtomicMelt({
         npub,
-        wallet_id: walletDoc._id,
-        proofs: meltResponse.change,
-        mint_url: MINT_URL,
-        transaction_type: "change",
-        transaction_id: transactionId,
-        metadata: {
-          source: "change",
-          change_from_melt: true,
-          quote_id: meltQuote.quote,
-        },
+        walletId: walletDoc._id,
+        tokenIds,
+        sendProofs: send,
+        keepProofs: keep,
+        meltChangeProofs: meltResponse.change || [],
+        transactionId,
+        meltQuote,
+        mintUrl: MINT_URL,
       });
-    }
 
-    return {
-      transactionId,
-      paymentResult: meltResponse.state,
-      paidAmount: meltQuote.amount,
-      feesPaid: meltQuote.fee_reserve,
-      changeAmount:
-        keep.reduce((sum, p) => sum + p.amount, 0) +
-        (meltResponse.change?.reduce((sum, p) => sum + p.amount, 0) || 0),
-      quoteId: meltQuote.quote,
-    };
+      logger.info("Atomic database operations completed successfully", {
+        npub,
+        transactionId,
+        atomicResult,
+      });
+
+      return {
+        transactionId,
+        paymentResult: meltResponse.state,
+        paidAmount: meltQuote.amount,
+        feesPaid: meltQuote.fee_reserve,
+        changeAmount:
+          keep.reduce((sum, p) => sum + p.amount, 0) +
+          (meltResponse.change?.reduce((sum, p) => sum + p.amount, 0) || 0),
+        quoteId: meltQuote.quote,
+        atomicOperationId: atomicResult.transactionId,
+        reconciliationPerformed: reconciliationResult.reconciled > 0,
+      };
+    } catch (dbError) {
+      logger.error("Atomic database operations failed", {
+        npub,
+        transactionId,
+        error: dbError.message,
+        stack: dbError.stack,
+      });
+
+      // The melt operation succeeded on the mint but database operations failed
+      // This is the exact scenario we're trying to prevent
+      throw new Error(
+        `CRITICAL: Melt succeeded on mint but database update failed: ${dbError.message}. Manual reconciliation required.`
+      );
+    }
   } catch (error) {
-    logger.error("Failed to melt tokens", {
+    logger.error("Atomic melt tokens operation failed", {
       npub,
       invoice: invoice.substring(0, 50) + "...",
       error: error.message,
+      errorType: error.constructor.name,
     });
+
+    // Provide specific error codes for different failure scenarios
+    if (error.message.includes("Token already spent")) {
+      const enhancedError = new Error(error.message);
+      enhancedError.code = "TOKEN_ALREADY_SPENT";
+      enhancedError.severity = "HIGH";
+      enhancedError.requiresReconciliation = true;
+      throw enhancedError;
+    }
+
+    if (error.message.includes("CRITICAL: Melt succeeded")) {
+      const enhancedError = new Error(error.message);
+      enhancedError.code = "MINT_DB_INCONSISTENCY";
+      enhancedError.severity = "CRITICAL";
+      enhancedError.requiresManualIntervention = true;
+      throw enhancedError;
+    }
+
     throw new Error(`Failed to melt tokens: ${error.message}`);
   }
 }
@@ -1301,18 +1384,22 @@ export async function getBalance(npub) {
 }
 
 /**
- * Verify proof states with mint
+ * Verify proof states with mint and detect discrepancies with database
  * @param {string} npub - User's Nostr npub string
  * @param {Array} [proofs] - Optional specific proofs to check, otherwise checks all unspent
  * @returns {Promise<Object>} Proof states and any discrepancies
  */
 export async function checkProofStates(npub, proofs = null) {
   try {
-    logger.info("Checking proof states", { npub, customProofs: !!proofs });
+    logger.info("Checking proof states with enhanced discrepancy detection", {
+      npub,
+      customProofs: !!proofs,
+    });
 
     const { wallet } = await initializeWallet(npub);
 
     let proofsToCheck = proofs;
+    let tokenMap = new Map(); // Map proof secrets to token info
 
     // If no specific proofs provided, get all unspent tokens
     if (!proofsToCheck) {
@@ -1323,8 +1410,28 @@ export async function checkProofStates(npub, proofs = null) {
       proofsToCheck = [];
 
       for (const token of unspentTokens) {
-        proofsToCheck.push(...token.proofs);
+        for (const proof of token.proofs) {
+          proofsToCheck.push(proof);
+          tokenMap.set(proof.secret, {
+            tokenId: token._id,
+            status: token.status,
+            transactionId: token.transaction_id,
+            amount: proof.amount,
+          });
+        }
       }
+    } else {
+      // For custom proofs, we still need to check database state
+      const secrets = proofs.map((p) => p.secret);
+      const secretMap = await walletRepositoryService.checkProofSecrets(
+        secrets
+      );
+
+      proofs.forEach((proof) => {
+        if (secretMap[proof.secret]) {
+          tokenMap.set(proof.secret, secretMap[proof.secret]);
+        }
+      });
     }
 
     if (proofsToCheck.length === 0) {
@@ -1335,13 +1442,14 @@ export async function checkProofStates(npub, proofs = null) {
         unspentCount: 0,
         pendingCount: 0,
         discrepancies: [],
+        consistent: true,
       };
     }
 
     // Check proof states with mint
     const states = await wallet.checkProofsStates(proofsToCheck);
 
-    // Analyze states
+    // Analyze states and detect discrepancies
     const stateAnalysis = {
       UNSPENT: 0,
       SPENT: 0,
@@ -1353,17 +1461,74 @@ export async function checkProofStates(npub, proofs = null) {
     states.forEach((state, index) => {
       stateAnalysis[state.state]++;
 
-      // Check for discrepancies with database
       const proof = proofsToCheck[index];
-      // This would require additional logic to compare with database state
+      const dbInfo = tokenMap.get(proof.secret);
+
+      // Check for discrepancies between mint state and database state
+      if (dbInfo) {
+        const mintState = state.state;
+        const dbState = dbInfo.status;
+
+        // Critical discrepancy: proof is spent on mint but unspent in database
+        if (mintState === "SPENT" && dbState === "unspent") {
+          discrepancies.push({
+            type: "CRITICAL_SPENT_MISMATCH",
+            secret: proof.secret,
+            amount: proof.amount,
+            mintState,
+            dbState,
+            tokenId: dbInfo.tokenId,
+            transactionId: dbInfo.transactionId,
+            severity: "HIGH",
+            description:
+              "Proof is spent on mint but marked as unspent in database",
+          });
+        }
+
+        // Warning: proof is unspent on mint but spent in database
+        if (mintState === "UNSPENT" && dbState === "spent") {
+          discrepancies.push({
+            type: "WARNING_UNSPENT_MISMATCH",
+            secret: proof.secret,
+            amount: proof.amount,
+            mintState,
+            dbState,
+            tokenId: dbInfo.tokenId,
+            transactionId: dbInfo.transactionId,
+            severity: "MEDIUM",
+            description:
+              "Proof is unspent on mint but marked as spent in database",
+          });
+        }
+
+        // Pending state discrepancies
+        if (mintState === "PENDING" && dbState !== "pending") {
+          discrepancies.push({
+            type: "PENDING_STATE_MISMATCH",
+            secret: proof.secret,
+            amount: proof.amount,
+            mintState,
+            dbState,
+            tokenId: dbInfo.tokenId,
+            transactionId: dbInfo.transactionId,
+            severity: "MEDIUM",
+            description: "Proof state mismatch involving pending state",
+          });
+        }
+      }
     });
 
-    logger.info("Completed proof state check", {
+    const isConsistent = discrepancies.length === 0;
+
+    logger.info("Completed enhanced proof state check", {
       npub,
       totalProofs: proofsToCheck.length,
       unspentCount: stateAnalysis.UNSPENT,
       spentCount: stateAnalysis.SPENT,
       pendingCount: stateAnalysis.PENDING,
+      discrepancyCount: discrepancies.length,
+      consistent: isConsistent,
+      criticalIssues: discrepancies.filter((d) => d.severity === "HIGH").length,
     });
 
     return {
@@ -1373,6 +1538,7 @@ export async function checkProofStates(npub, proofs = null) {
       unspentCount: stateAnalysis.UNSPENT,
       pendingCount: stateAnalysis.PENDING,
       discrepancies,
+      consistent: isConsistent,
       mintUrl: MINT_URL,
     };
   } catch (error) {
@@ -1382,6 +1548,161 @@ export async function checkProofStates(npub, proofs = null) {
       error: error.message,
     });
     throw new Error(`Failed to check proof states: ${error.message}`);
+  }
+}
+
+/**
+ * Reconcile proof states between mint and database
+ * Fixes database state to match mint state when inconsistencies are detected
+ * @param {string} npub - User's Nostr npub string
+ * @param {Object} [options] - Reconciliation options
+ * @param {boolean} [options.dryRun=false] - If true, only report what would be changed
+ * @param {Array} [options.specificProofs] - Only reconcile specific proofs
+ * @returns {Promise<Object>} Reconciliation results
+ */
+export async function reconcileProofStates(npub, options = {}) {
+  const { dryRun = false, specificProofs = null } = options;
+
+  try {
+    logger.info("Starting proof state reconciliation", {
+      npub,
+      dryRun,
+      specificProofs: !!specificProofs,
+    });
+
+    // First, check current proof states to identify discrepancies
+    const stateCheck = await checkProofStates(npub, specificProofs);
+
+    if (stateCheck.consistent) {
+      logger.info("No reconciliation needed - states are consistent", { npub });
+      return {
+        reconciled: 0,
+        errors: 0,
+        changes: [],
+        consistent: true,
+        dryRun,
+      };
+    }
+
+    const changes = [];
+    const errors = [];
+    let reconciledCount = 0;
+
+    // Process each discrepancy
+    for (const discrepancy of stateCheck.discrepancies) {
+      try {
+        const change = {
+          tokenId: discrepancy.tokenId,
+          transactionId: discrepancy.transactionId,
+          secret: discrepancy.secret,
+          amount: discrepancy.amount,
+          type: discrepancy.type,
+          severity: discrepancy.severity,
+          oldState: discrepancy.dbState,
+          newState: null,
+          action: null,
+        };
+
+        // Determine the correct action based on discrepancy type
+        if (discrepancy.type === "CRITICAL_SPENT_MISMATCH") {
+          // Proof is spent on mint but unspent in database - mark as spent
+          change.newState = "spent";
+          change.action = "mark_as_spent";
+
+          if (!dryRun) {
+            await walletRepositoryService.markTokensAsSpent([
+              discrepancy.tokenId,
+            ]);
+            logger.info("Reconciled critical spent mismatch", {
+              npub,
+              tokenId: discrepancy.tokenId,
+              secret: discrepancy.secret,
+            });
+          }
+
+          reconciledCount++;
+        } else if (discrepancy.type === "WARNING_UNSPENT_MISMATCH") {
+          // Proof is unspent on mint but spent in database - mark as unspent
+          change.newState = "unspent";
+          change.action = "mark_as_unspent";
+
+          if (!dryRun) {
+            // Update token status back to unspent
+            await walletRepositoryService.updateTokenStatus(
+              discrepancy.tokenId,
+              "unspent"
+            );
+            logger.info("Reconciled unspent mismatch", {
+              npub,
+              tokenId: discrepancy.tokenId,
+              secret: discrepancy.secret,
+            });
+          }
+
+          reconciledCount++;
+        } else if (discrepancy.type === "PENDING_STATE_MISMATCH") {
+          // Handle pending state mismatches case by case
+          if (
+            discrepancy.mintState === "PENDING" &&
+            discrepancy.dbState === "unspent"
+          ) {
+            change.newState = "pending";
+            change.action = "mark_as_pending";
+
+            if (!dryRun) {
+              await walletRepositoryService.updateTokenStatus(
+                discrepancy.tokenId,
+                "pending"
+              );
+            }
+
+            reconciledCount++;
+          }
+        }
+
+        changes.push(change);
+      } catch (error) {
+        logger.error("Failed to reconcile individual discrepancy", {
+          npub,
+          discrepancy,
+          error: error.message,
+        });
+
+        errors.push({
+          discrepancy,
+          error: error.message,
+        });
+      }
+    }
+
+    const result = {
+      reconciled: reconciledCount,
+      errors: errors.length,
+      changes,
+      errorDetails: errors,
+      consistent:
+        reconciledCount === stateCheck.discrepancies.length &&
+        errors.length === 0,
+      dryRun,
+    };
+
+    logger.info("Completed proof state reconciliation", {
+      npub,
+      dryRun,
+      totalDiscrepancies: stateCheck.discrepancies.length,
+      reconciled: reconciledCount,
+      errors: errors.length,
+      nowConsistent: result.consistent,
+    });
+
+    return result;
+  } catch (error) {
+    logger.error("Failed to reconcile proof states", {
+      npub,
+      dryRun,
+      error: error.message,
+    });
+    throw new Error(`Failed to reconcile proof states: ${error.message}`);
   }
 }
 

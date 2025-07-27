@@ -14,6 +14,7 @@ import {
   receiveTokens as cashuReceiveTokens,
   meltTokens as cashuMeltTokens,
   checkProofStates as cashuCheckProofStates,
+  reconcileProofStates as cashuReconcileProofStates,
 } from "../services/cashu.service.js";
 import walletRepositoryService from "../services/walletRepository.service.js";
 import ValidationService from "../services/validation.service.js";
@@ -639,21 +640,30 @@ export const receiveTokens = asyncHandler(async (req, res) => {
 });
 
 /**
- * Melt tokens to pay Lightning invoice
+ * Melt tokens to pay Lightning invoice with atomic operations and state consistency
  * POST /api/wallet/:npub/melt
  */
 export const meltTokens = asyncHandler(async (req, res) => {
   const { npub } = req.params;
   const { invoice } = req.body;
-  logger.info("Starting melt tokens operation", { npub });
+  const startTime = Date.now();
+
+  logger.info("Starting atomic melt tokens operation", {
+    npub,
+    timestamp: new Date().toISOString(),
+  });
 
   if (!npub) {
-    return res.status(400).json({ error: "npub is required" });
+    return res.status(400).json({
+      error: "npub is required",
+      code: "MISSING_NPUB",
+    });
   }
 
   if (!invoice || typeof invoice !== "string") {
     return res.status(400).json({
       error: "invoice is required and must be a string",
+      code: "INVALID_INVOICE",
     });
   }
 
@@ -661,24 +671,33 @@ export const meltTokens = asyncHandler(async (req, res) => {
   try {
     nip19.decode(npub);
   } catch (error) {
-    return res.status(400).json({ error: "Invalid npub format" });
+    return res.status(400).json({
+      error: "Invalid npub format",
+      code: "INVALID_NPUB_FORMAT",
+    });
   }
 
   // Validate user exists
   const keys = await getAllKeys();
   const keyObj = keys.find((k) => k.npub === npub);
   if (!keyObj) {
-    return res.status(404).json({ error: "User not found" });
+    return res.status(404).json({
+      error: "User not found",
+      code: "USER_NOT_FOUND",
+    });
   }
 
   try {
     const meltResult = await cashuMeltTokens(npub, invoice);
+    const operationTime = Date.now() - startTime;
 
-    logger.info("Successfully melted tokens", {
+    logger.info("Successfully completed atomic melt operation", {
       npub,
       transactionId: meltResult.transactionId,
       paidAmount: meltResult.paidAmount,
       paymentResult: meltResult.paymentResult,
+      operationTime: `${operationTime}ms`,
+      reconciliationPerformed: meltResult.reconciliationPerformed,
     });
 
     res.json({
@@ -689,15 +708,80 @@ export const meltTokens = asyncHandler(async (req, res) => {
       feesPaid: meltResult.feesPaid,
       changeAmount: meltResult.changeAmount,
       quoteId: meltResult.quoteId,
+      operationTime,
+      reconciliationPerformed: meltResult.reconciliationPerformed,
+      atomicOperationId: meltResult.atomicOperationId,
     });
   } catch (error) {
-    logger.error("Failed to melt tokens", {
+    const operationTime = Date.now() - startTime;
+
+    // Enhanced error handling with specific error codes
+    logger.error("Atomic melt tokens operation failed", {
       npub,
       error: error.message,
+      errorCode: error.code,
+      errorSeverity: error.severity,
+      operationTime: `${operationTime}ms`,
+      requiresReconciliation: error.requiresReconciliation,
+      requiresManualIntervention: error.requiresManualIntervention,
     });
+
+    // Handle specific error types with appropriate HTTP status codes and responses
+    if (error.code === "TOKEN_ALREADY_SPENT") {
+      return res.status(409).json({
+        error: "Token state inconsistency detected",
+        message: error.message,
+        code: error.code,
+        severity: error.severity,
+        requiresReconciliation: true,
+        operationTime,
+        recommendation: "Please run proof state reconciliation and try again",
+      });
+    }
+
+    if (error.code === "MINT_DB_INCONSISTENCY") {
+      return res.status(500).json({
+        error: "Critical system inconsistency",
+        message: error.message,
+        code: error.code,
+        severity: error.severity,
+        requiresManualIntervention: true,
+        operationTime,
+        recommendation:
+          "Contact system administrator - manual reconciliation required",
+      });
+    }
+
+    // Handle insufficient balance errors
+    if (error.message.includes("Insufficient balance")) {
+      return res.status(400).json({
+        error: "Insufficient balance",
+        message: error.message,
+        code: "INSUFFICIENT_BALANCE",
+        operationTime,
+      });
+    }
+
+    // Handle network/connectivity errors
+    if (
+      error.message.includes("Failed to create send transaction") ||
+      error.message.includes("Melt operation failed")
+    ) {
+      return res.status(502).json({
+        error: "Lightning network error",
+        message: error.message,
+        code: "LIGHTNING_NETWORK_ERROR",
+        operationTime,
+        recommendation: "Please try again later",
+      });
+    }
+
+    // Generic error response
     res.status(500).json({
       error: "Failed to melt tokens",
       message: error.message,
+      code: "MELT_OPERATION_FAILED",
+      operationTime,
     });
   }
 });
@@ -765,6 +849,115 @@ export const checkProofStates = asyncHandler(async (req, res) => {
     res.status(500).json({
       error: "Failed to check proof states",
       message: error.message,
+    });
+  }
+});
+
+/**
+ * Reconcile proof states between mint and database
+ * POST /api/wallet/:npub/reconcile
+ */
+export const reconcileProofStates = asyncHandler(async (req, res) => {
+  const { npub } = req.params;
+  const { dryRun = false, specificProofs } = req.body;
+  const startTime = Date.now();
+
+  logger.info("Starting proof state reconciliation", {
+    npub,
+    dryRun,
+    hasSpecificProofs: !!specificProofs,
+  });
+
+  if (!npub) {
+    return res.status(400).json({
+      error: "npub is required",
+      code: "MISSING_NPUB",
+    });
+  }
+
+  // Validate npub format
+  try {
+    nip19.decode(npub);
+  } catch (error) {
+    return res.status(400).json({
+      error: "Invalid npub format",
+      code: "INVALID_NPUB_FORMAT",
+    });
+  }
+
+  // Validate user exists
+  const keys = await getAllKeys();
+  const keyObj = keys.find((k) => k.npub === npub);
+  if (!keyObj) {
+    return res.status(404).json({
+      error: "User not found",
+      code: "USER_NOT_FOUND",
+    });
+  }
+
+  // Validate specificProofs if provided
+  let proofsToReconcile = null;
+  if (specificProofs) {
+    if (!Array.isArray(specificProofs)) {
+      return res.status(400).json({
+        error: "specificProofs must be an array",
+        code: "INVALID_PROOFS_FORMAT",
+      });
+    }
+    proofsToReconcile = specificProofs;
+  }
+
+  try {
+    const reconciliationResult = await cashuReconcileProofStates(npub, {
+      dryRun,
+      specificProofs: proofsToReconcile,
+    });
+
+    const operationTime = Date.now() - startTime;
+
+    logger.info("Successfully completed proof state reconciliation", {
+      npub,
+      dryRun,
+      reconciled: reconciliationResult.reconciled,
+      errors: reconciliationResult.errors,
+      consistent: reconciliationResult.consistent,
+      operationTime: `${operationTime}ms`,
+    });
+
+    res.json({
+      success: true,
+      reconciled: reconciliationResult.reconciled,
+      errors: reconciliationResult.errors,
+      changes: reconciliationResult.changes,
+      errorDetails: reconciliationResult.errorDetails,
+      consistent: reconciliationResult.consistent,
+      dryRun: reconciliationResult.dryRun,
+      operationTime,
+      summary: {
+        totalChanges: reconciliationResult.changes.length,
+        criticalIssuesFixed: reconciliationResult.changes.filter(
+          (c) => c.severity === "HIGH"
+        ).length,
+        warningsFixed: reconciliationResult.changes.filter(
+          (c) => c.severity === "MEDIUM"
+        ).length,
+      },
+    });
+  } catch (error) {
+    const operationTime = Date.now() - startTime;
+
+    logger.error("Failed to reconcile proof states", {
+      npub,
+      dryRun,
+      error: error.message,
+      operationTime: `${operationTime}ms`,
+    });
+
+    res.status(500).json({
+      error: "Failed to reconcile proof states",
+      message: error.message,
+      code: "RECONCILIATION_FAILED",
+      operationTime,
     });
   }
 });

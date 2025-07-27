@@ -87,6 +87,17 @@ router.post("/:npub/melt", walletController.meltTokens);
 router.get("/:npub/proofs/status", walletController.checkProofStates);
 
 /**
+ * Reconcile proof states between mint and database
+ * POST /api/wallet/:npub/reconcile
+ *
+ * Body: {
+ *   "dryRun": false,
+ *   "specificProofs": [...] (optional, array of specific proofs to reconcile)
+ * }
+ */
+router.post("/:npub/reconcile", walletController.reconcileProofStates);
+
+/**
  * Get transaction history for a user
  * GET /api/wallet/:npub/transactions
  *

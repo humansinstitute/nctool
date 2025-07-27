@@ -93,7 +93,7 @@ class WalletRepositoryService {
   // ==================== TOKEN OPERATIONS ====================
 
   /**
-   * Store new tokens in the database
+   * Store new tokens in the database with optional session support for atomic operations
    * @param {Object} tokenData - Token storage data
    * @param {string} tokenData.npub - User's NPUB
    * @param {string} tokenData.wallet_id - Wallet ID
@@ -102,22 +102,44 @@ class WalletRepositoryService {
    * @param {string} tokenData.transaction_type - Transaction type
    * @param {string} tokenData.transaction_id - Transaction ID
    * @param {Object} [tokenData.metadata] - Additional metadata
+   * @param {Object} [options] - Additional options
+   * @param {mongoose.ClientSession} [options.session] - MongoDB session for atomic operations
    * @returns {Promise<CashuToken>} Created token document
    */
-  async storeTokens(tokenData) {
+  async storeTokens(tokenData, options = {}) {
     try {
-      // Validate that proofs don't already exist (double-spend prevention)
-      const secrets = tokenData.proofs.map((proof) => proof.secret);
-      const existingTokens = await CashuToken.findBySecrets(secrets);
+      const { session } = options;
 
-      if (existingTokens.length > 0) {
-        throw new Error(
-          "Some proofs already exist in database (potential double-spend)"
+      // ADD DEBUG LOG:
+      console.log(
+        `[storeTokens] Called with transaction_type: ${
+          tokenData.transaction_type
+        }, proofs: ${tokenData.proofs?.length}, hasSession: ${!!session}`
+      );
+
+      // Validate that proofs don't already exist (double-spend prevention)
+      // Skip this check for "melted" and "change" transactions since they reference already-spent proofs
+      if (
+        tokenData.transaction_type !== "melted" &&
+        tokenData.transaction_type !== "change"
+      ) {
+        const secrets = tokenData.proofs.map((proof) => proof.secret);
+        const findOptions = session ? { session } : {};
+        const existingTokens = await CashuToken.findBySecrets(
+          secrets,
+          findOptions
         );
+
+        if (existingTokens.length > 0) {
+          throw new Error(
+            "Some proofs already exist in database (potential double-spend)"
+          );
+        }
       }
 
       const token = new CashuToken(tokenData);
-      return await token.save();
+      const saveOptions = session ? { session } : {};
+      return await token.save(saveOptions);
     } catch (error) {
       throw new Error(`Failed to store tokens: ${error.message}`);
     }
@@ -138,12 +160,17 @@ class WalletRepositoryService {
   }
 
   /**
-   * Mark tokens as spent
+   * Mark tokens as spent with optional session support for atomic operations
    * @param {string[]} tokenIds - Array of token document IDs
+   * @param {Object} [options] - Additional options
+   * @param {mongoose.ClientSession} [options.session] - MongoDB session for atomic operations
    * @returns {Promise<number>} Number of tokens updated
    */
-  async markTokensAsSpent(tokenIds) {
+  async markTokensAsSpent(tokenIds, options = {}) {
     try {
+      const { session } = options;
+      const updateOptions = session ? { session } : {};
+
       const result = await CashuToken.updateMany(
         { _id: { $in: tokenIds } },
         {
@@ -151,11 +178,181 @@ class WalletRepositoryService {
             status: "spent",
             spent_at: new Date(),
           },
-        }
+        },
+        updateOptions
       );
       return result.modifiedCount;
     } catch (error) {
       throw new Error(`Failed to mark tokens as spent: ${error.message}`);
+    }
+  }
+
+  /**
+   * Execute atomic melt operation with full rollback support
+   * @param {Object} meltData - Melt operation data
+   * @param {string} meltData.npub - User's NPUB
+   * @param {string} meltData.walletId - Wallet ID
+   * @param {Array} meltData.tokenIds - Token IDs to mark as spent
+   * @param {Array} meltData.sendProofs - Proofs used for melting
+   * @param {Array} meltData.keepProofs - Change proofs from send operation
+   * @param {Array} meltData.meltChangeProofs - Change proofs from melt operation
+   * @param {string} meltData.transactionId - Transaction ID
+   * @param {Object} meltData.meltQuote - Melt quote information
+   * @param {string} meltData.mintUrl - Mint URL
+   * @returns {Promise<Object>} Atomic operation result
+   */
+  async executeAtomicMelt(meltData) {
+    const session = await mongoose.startSession();
+
+    try {
+      let result;
+
+      await session.withTransaction(async () => {
+        const {
+          npub,
+          walletId,
+          tokenIds,
+          sendProofs,
+          keepProofs,
+          meltChangeProofs,
+          transactionId,
+          meltQuote,
+          mintUrl,
+        } = meltData;
+
+        // Step 1: Mark original tokens as spent
+        const spentCount = await this.markTokensAsSpent(tokenIds, { session });
+
+        if (spentCount !== tokenIds.length) {
+          throw new Error(
+            `Expected to mark ${tokenIds.length} tokens as spent, but only marked ${spentCount}`
+          );
+        }
+
+        // Step 2: Store melted tokens record for transaction history
+        const meltedTokenDoc = await this.storeTokens(
+          {
+            npub,
+            wallet_id: walletId,
+            proofs: sendProofs,
+            mint_url: mintUrl,
+            transaction_type: "melted",
+            transaction_id: transactionId,
+            metadata: {
+              source: "lightning",
+              quote_id: meltQuote.quote,
+              invoice_amount: meltQuote.amount,
+              fee_reserve: meltQuote.fee_reserve,
+              total_amount: meltQuote.amount + meltQuote.fee_reserve,
+            },
+          },
+          { session }
+        );
+
+        // Step 3: Store change tokens from send operation if any
+        let sendChangeTokenDoc = null;
+        if (keepProofs.length > 0) {
+          sendChangeTokenDoc = await this.storeTokens(
+            {
+              npub,
+              wallet_id: walletId,
+              proofs: keepProofs,
+              mint_url: mintUrl,
+              transaction_type: "change",
+              transaction_id: transactionId,
+              metadata: {
+                source: "change",
+                change_from_selection: true,
+                melt_transaction_id: transactionId,
+              },
+            },
+            { session }
+          );
+        }
+
+        // Step 4: Store change tokens from melt operation if any
+        let meltChangeTokenDoc = null;
+        if (meltChangeProofs && meltChangeProofs.length > 0) {
+          meltChangeTokenDoc = await this.storeTokens(
+            {
+              npub,
+              wallet_id: walletId,
+              proofs: meltChangeProofs,
+              mint_url: mintUrl,
+              transaction_type: "change",
+              transaction_id: transactionId,
+              metadata: {
+                source: "change",
+                change_from_melt: true,
+                quote_id: meltQuote.quote,
+              },
+            },
+            { session }
+          );
+        }
+
+        result = {
+          transactionId,
+          meltedTokenId: meltedTokenDoc._id,
+          sendChangeTokenId: sendChangeTokenDoc?._id || null,
+          meltChangeTokenId: meltChangeTokenDoc?._id || null,
+          spentTokensCount: spentCount,
+          keepProofsCount: keepProofs.length,
+          meltChangeProofsCount: meltChangeProofs?.length || 0,
+        };
+      });
+
+      return result;
+    } catch (error) {
+      // Transaction will be automatically aborted on error
+      throw new Error(`Atomic melt operation failed: ${error.message}`);
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  /**
+   * Update token status
+   * @param {string} tokenId - Token document ID
+   * @param {string} newStatus - New status to set
+   * @returns {Promise<CashuToken>} Updated token document
+   */
+  async updateTokenStatus(tokenId, newStatus) {
+    try {
+      const validStatuses = ["unspent", "spent", "pending", "failed"];
+      if (!validStatuses.includes(newStatus)) {
+        throw new Error(
+          `Invalid status: ${newStatus}. Must be one of: ${validStatuses.join(
+            ", "
+          )}`
+        );
+      }
+
+      const updateData = { status: newStatus };
+
+      // Add timestamp for spent status
+      if (newStatus === "spent") {
+        updateData.spent_at = new Date();
+      }
+
+      // Clear spent_at for non-spent statuses
+      if (newStatus !== "spent") {
+        updateData.$unset = { spent_at: 1 };
+      }
+
+      const updatedToken = await CashuToken.findByIdAndUpdate(
+        tokenId,
+        updateData,
+        { new: true, runValidators: true }
+      );
+
+      if (!updatedToken) {
+        throw new Error(`Token with ID ${tokenId} not found`);
+      }
+
+      return updatedToken;
+    } catch (error) {
+      throw new Error(`Failed to update token status: ${error.message}`);
     }
   }
 
