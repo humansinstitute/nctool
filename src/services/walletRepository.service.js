@@ -108,14 +108,52 @@ class WalletRepositoryService {
    */
   async storeTokens(tokenData, options = {}) {
     try {
-      const { session } = options;
+      const { session, explicitStatus } = options;
 
       // ADD DEBUG LOG:
       console.log(
         `[storeTokens] Called with transaction_type: ${
           tokenData.transaction_type
-        }, proofs: ${tokenData.proofs?.length}, hasSession: ${!!session}`
+        }, proofs: ${
+          tokenData.proofs?.length
+        }, hasSession: ${!!session}, explicitStatus: ${explicitStatus}`
       );
+
+      // Validate explicit status parameter when provided
+      if (explicitStatus) {
+        const validStatuses = ["unspent", "spent", "pending", "failed"];
+        if (!validStatuses.includes(explicitStatus)) {
+          throw new Error(
+            `Invalid explicit status: ${explicitStatus}. Must be one of: ${validStatuses.join(
+              ", "
+            )}`
+          );
+        }
+      }
+
+      // Determine the correct status based on transaction type and explicit override
+      let finalStatus = explicitStatus || tokenData.status;
+
+      if (!finalStatus) {
+        // Apply status rules based on transaction type
+        switch (tokenData.transaction_type) {
+          case "change":
+            finalStatus = "unspent";
+            break;
+          case "melted":
+            finalStatus = "spent"; // CRITICAL: melted tokens should be spent, not unspent
+            break;
+          case "received":
+          case "minted":
+            finalStatus = "unspent";
+            break;
+          case "sent":
+            finalStatus = "spent";
+            break;
+          default:
+            finalStatus = "unspent"; // Default fallback
+        }
+      }
 
       // Validate that proofs don't already exist (double-spend prevention)
       // Skip this check for "melted" and "change" transactions since they reference already-spent proofs
@@ -137,7 +175,13 @@ class WalletRepositoryService {
         }
       }
 
-      const token = new CashuToken(tokenData);
+      // Create token with explicit status
+      const tokenWithStatus = {
+        ...tokenData,
+        status: finalStatus,
+      };
+
+      const token = new CashuToken(tokenWithStatus);
       const saveOptions = session ? { session } : {};
       return await token.save(saveOptions);
     } catch (error) {
@@ -229,25 +273,33 @@ class WalletRepositoryService {
           );
         }
 
-        // Step 2: Store melted tokens record for transaction history
-        const meltedTokenDoc = await this.storeTokens(
-          {
-            npub,
-            wallet_id: walletId,
-            proofs: sendProofs,
-            mint_url: mintUrl,
-            transaction_type: "melted",
-            transaction_id: transactionId,
-            metadata: {
-              source: "lightning",
-              quote_id: meltQuote.quote,
-              invoice_amount: meltQuote.amount,
-              fee_reserve: meltQuote.fee_reserve,
-              total_amount: meltQuote.amount + meltQuote.fee_reserve,
-            },
-          },
-          { session }
-        );
+        // Step 2: CRITICAL FIX - Do not create melted token records
+        // The original tokens are already marked as spent in Step 1
+        // Creating melted tokens with any status causes double-counting
+        // Instead, log the transaction details for audit purposes
+        const transactionRecord = {
+          transaction_id: transactionId,
+          transaction_type: "melted",
+          npub,
+          wallet_id: walletId,
+          mint_url: mintUrl,
+          amount_sent: meltQuote.amount,
+          fee_paid: meltQuote.fee_reserve,
+          total_amount: meltQuote.amount + meltQuote.fee_reserve,
+          quote_id: meltQuote.quote,
+          proofs_used: sendProofs.length,
+          timestamp: new Date(),
+          status: "completed",
+        };
+
+        console.log(`[executeAtomicMelt] Lightning payment completed:`, {
+          transactionId,
+          amount_sent: meltQuote.amount,
+          fee_paid: meltQuote.fee_reserve,
+          total_deducted: meltQuote.amount + meltQuote.fee_reserve,
+          proofs_spent: sendProofs.length,
+          timestamp: new Date().toISOString(),
+        });
 
         // Step 3: Store change tokens from send operation if any
         let sendChangeTokenDoc = null;
@@ -259,14 +311,14 @@ class WalletRepositoryService {
               proofs: keepProofs,
               mint_url: mintUrl,
               transaction_type: "change",
-              transaction_id: transactionId,
+              transaction_id: `${transactionId}_keep_change`,
               metadata: {
                 source: "change",
                 change_from_selection: true,
                 melt_transaction_id: transactionId,
               },
             },
-            { session }
+            { session, explicitStatus: "unspent" }
           );
         }
 
@@ -280,25 +332,29 @@ class WalletRepositoryService {
               proofs: meltChangeProofs,
               mint_url: mintUrl,
               transaction_type: "change",
-              transaction_id: transactionId,
+              transaction_id: `${transactionId}_melt_change`,
               metadata: {
                 source: "change",
                 change_from_melt: true,
                 quote_id: meltQuote.quote,
+                melt_transaction_id: transactionId,
               },
             },
-            { session }
+            { session, explicitStatus: "unspent" }
           );
         }
 
         result = {
           transactionId,
-          meltedTokenId: meltedTokenDoc._id,
+          transactionRecord, // Include transaction record instead of melted token ID
           sendChangeTokenId: sendChangeTokenDoc?._id || null,
           meltChangeTokenId: meltChangeTokenDoc?._id || null,
           spentTokensCount: spentCount,
           keepProofsCount: keepProofs.length,
           meltChangeProofsCount: meltChangeProofs?.length || 0,
+          amountSent: meltQuote.amount,
+          feePaid: meltQuote.fee_reserve,
+          totalDeducted: meltQuote.amount + meltQuote.fee_reserve,
         };
       });
 
@@ -607,6 +663,195 @@ class WalletRepositoryService {
     } catch (error) {
       throw new Error(`Failed to get detailed balance: ${error.message}`);
     }
+  }
+
+  /**
+   * Validate balance consistency by checking for accounting errors
+   * @param {string} npub - User's NPUB
+   * @param {string} [mintUrl] - Optional mint URL filter
+   * @returns {Promise<Object>} Validation result with any inconsistencies found
+   */
+  async validateBalanceConsistency(npub, mintUrl = null) {
+    try {
+      console.log(
+        `[validateBalanceConsistency] Starting validation for npub: ${npub}`
+      );
+
+      // Get all tokens for the user
+      const query = { npub };
+      if (mintUrl) query.mint_url = mintUrl;
+
+      const allTokens = await CashuToken.find(query).lean();
+
+      // Check for problematic melted tokens with unspent status
+      const problematicMeltedTokens = allTokens.filter(
+        (token) =>
+          token.transaction_type === "melted" && token.status === "unspent"
+      );
+
+      // Check for duplicate proof secrets
+      const allSecrets = [];
+      const duplicateSecrets = [];
+
+      allTokens.forEach((token) => {
+        if (token.proofs && token.proofs.length > 0) {
+          token.proofs.forEach((proof) => {
+            if (allSecrets.includes(proof.secret)) {
+              duplicateSecrets.push(proof.secret);
+            } else {
+              allSecrets.push(proof.secret);
+            }
+          });
+        }
+      });
+
+      // Calculate expected vs actual balance
+      const balanceBreakdown = await this.calculateBalance(npub, mintUrl);
+
+      // Check for negative balances
+      const hasNegativeBalance = Object.values(balanceBreakdown).some(
+        (balance) => balance < 0
+      );
+
+      const validationResult = {
+        npub,
+        mintUrl,
+        isValid:
+          problematicMeltedTokens.length === 0 &&
+          duplicateSecrets.length === 0 &&
+          !hasNegativeBalance,
+        issues: {
+          problematicMeltedTokens: problematicMeltedTokens.length,
+          duplicateSecrets: duplicateSecrets.length,
+          hasNegativeBalance,
+        },
+        details: {
+          problematicMeltedTokens: problematicMeltedTokens.map((t) => ({
+            id: t._id,
+            transaction_id: t.transaction_id,
+            total_amount: t.total_amount,
+            status: t.status,
+            created_at: t.created_at,
+          })),
+          duplicateSecrets: [...new Set(duplicateSecrets)],
+          balanceBreakdown,
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+      if (!validationResult.isValid) {
+        console.warn(
+          `[validateBalanceConsistency] Issues found:`,
+          validationResult.issues
+        );
+      }
+
+      return validationResult;
+    } catch (error) {
+      throw new Error(
+        `Failed to validate balance consistency: ${error.message}`
+      );
+    }
+  }
+
+  /**
+   * Check for unmigrated tokens that may cause accounting issues
+   * @param {string} npub - User's NPUB
+   * @param {string} [mintUrl] - Optional mint URL filter
+   * @returns {Promise<Object>} Migration status and recommendations
+   */
+  async checkForUnmigratedTokens(npub, mintUrl = null) {
+    try {
+      console.log(`[checkForUnmigratedTokens] Checking for npub: ${npub}`);
+
+      const query = { npub };
+      if (mintUrl) query.mint_url = mintUrl;
+
+      // Find tokens that may need migration
+      const suspiciousTokens = await CashuToken.find({
+        ...query,
+        $or: [
+          // Melted tokens with unspent status (the main bug)
+          { transaction_type: "melted", status: "unspent" },
+          // Tokens with missing or invalid metadata
+          { "metadata.source": { $exists: false } },
+          { "metadata.source": null },
+          // Tokens with inconsistent total_amount
+          { total_amount: { $lte: 0 }, status: { $ne: "pending" } },
+        ],
+      }).lean();
+
+      const migrationNeeded = suspiciousTokens.length > 0;
+
+      const result = {
+        npub,
+        mintUrl,
+        migrationNeeded,
+        suspiciousTokensCount: suspiciousTokens.length,
+        recommendations: [],
+        suspiciousTokens: suspiciousTokens.map((token) => ({
+          id: token._id,
+          transaction_id: token.transaction_id,
+          transaction_type: token.transaction_type,
+          status: token.status,
+          total_amount: token.total_amount,
+          issue: this._identifyTokenIssue(token),
+          created_at: token.created_at,
+        })),
+        timestamp: new Date().toISOString(),
+      };
+
+      // Generate recommendations
+      if (migrationNeeded) {
+        const meltedUnspentCount = suspiciousTokens.filter(
+          (t) => t.transaction_type === "melted" && t.status === "unspent"
+        ).length;
+
+        if (meltedUnspentCount > 0) {
+          result.recommendations.push(
+            `Fix ${meltedUnspentCount} melted tokens with incorrect unspent status`
+          );
+        }
+
+        const missingMetadataCount = suspiciousTokens.filter(
+          (t) => !t.metadata?.source
+        ).length;
+
+        if (missingMetadataCount > 0) {
+          result.recommendations.push(
+            `Update metadata for ${missingMetadataCount} tokens missing source information`
+          );
+        }
+      }
+
+      return result;
+    } catch (error) {
+      throw new Error(
+        `Failed to check for unmigrated tokens: ${error.message}`
+      );
+    }
+  }
+
+  /**
+   * Helper method to identify specific issues with a token
+   * @private
+   */
+  _identifyTokenIssue(token) {
+    const issues = [];
+
+    if (token.transaction_type === "melted" && token.status === "unspent") {
+      issues.push("melted_token_unspent_status");
+    }
+
+    if (!token.metadata?.source) {
+      issues.push("missing_metadata_source");
+    }
+
+    if (token.total_amount <= 0 && token.status !== "pending") {
+      issues.push("invalid_total_amount");
+    }
+
+    return issues.join(", ");
   }
 
   // ==================== TRANSACTION HISTORY ====================

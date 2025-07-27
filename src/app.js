@@ -7,6 +7,7 @@ import actionRoutes from "./routes/action.routes.js";
 import powRoutes from "./routes/pow.routes.js";
 import streamRoutes from "./routes/stream.routes.js";
 import walletRoutes from "./routes/wallet.routes.js";
+import adminRoutes from "./routes/admin.routes.js";
 import { errorHandler } from "./middlewares/errorHandler.js";
 
 export const app = express();
@@ -20,5 +21,6 @@ app.use("/action", actionRoutes);
 app.use("/pow", powRoutes);
 app.use("/stream", streamRoutes);
 app.use("/api/wallet", walletRoutes);
+app.use("/admin", adminRoutes);
 
 app.use(errorHandler);

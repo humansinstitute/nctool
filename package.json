@@ -6,7 +6,15 @@
   "scripts": {
     "test": "jest",
     "start": "node src/server.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "migration": "node src/scripts/run-migration.js",
+    "migration:status": "node src/scripts/run-migration.js status",
+    "migration:preview": "node src/scripts/run-migration.js preview",
+    "migration:up": "node src/scripts/run-migration.js up --confirm",
+    "migration:down": "node src/scripts/run-migration.js down --confirm",
+    "test:migration": "jest tests/integration/migration.test.js",
+    "test:unit": "jest tests/unit/",
+    "test:integration": "jest tests/integration/"
   },
   "keywords": [],
   "author": "",
@@ -16,13 +24,18 @@
     "@cashu/cashu-ts": "^2.5.2",
     "@nostr-dev-kit/ndk": "^2.13.3",
     "axios": "^1.9.0",
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.3",
+    "commander": "^12.0.0",
     "dotenv": "^16.5.0",
     "eventsource": "^3.0.6",
     "express": "^5.1.0",
+    "inquirer": "^9.2.15",
     "log-update": "^6.1.0",
     "mongoose": "^8.14.1",
     "morgan": "^1.10.0",
     "nostr-tools": "^2.12.0",
+    "ora": "^8.0.1",
     "winston": "^3.17.0"
   },
   "devDependencies": {
