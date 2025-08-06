@@ -560,6 +560,21 @@ async function getWalletInfo(sessionKey) {
 
 async function main() {
   await connectDB();
+
+  // Attempt to start NostrMQ Remote API (graceful degradation on failure)
+  let nostrMq;
+  try {
+    nostrMq = new NostrMQService();
+    await nostrMq.initialize();
+    await nostrMq.start();
+    console.log("✅ NostrMQ remote API enabled");
+  } catch (err) {
+    console.warn(
+      "⚠️  NostrMQ failed to start, continuing without remote API:",
+      err.message || err
+    );
+  }
+
   const sessionKey = await chooseKey();
   tailEvents(sessionKey);
 

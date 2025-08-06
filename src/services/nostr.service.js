@@ -29,7 +29,7 @@ const defaultRemoteRelaysString = [
   "wss://nostr.bitcoiner.social",
   "wss://relay.damus.io",
   "wss://nos.lol",
-  "wss://relay.snort.social",
+  // removed 'wss://relay.snort.social' from defaults to respect env removal
   "wss://purplepag.es",
   "wss://relay.nostr.band",
 ].join(",");
@@ -40,10 +40,13 @@ const remoteRelaysEnv = normalize(process.env.NOSTR_REMOTE_RELAYS) || defaultRem
 // Helper function to parse comma-separated strings into an array of URLs
 const parseRelayUrls = (urlsString) => {
   if (!urlsString) return [];
+  const deny = new Set([
+    "wss://relay.snort.social",
+  ]);
   return urlsString
     .split(",")
     .map((url) => normalize(url))
-    .filter((url) => url); // Remove any empty strings
+    .filter((url) => url && !deny.has(url)); // Remove any empty strings and denylisted relays
 };
 
 const localRelayUrls = parseRelayUrls(localRelaysEnv);
