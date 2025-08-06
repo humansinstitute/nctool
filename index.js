@@ -13,9 +13,8 @@ import { nip19, finalizeEvent } from "nostr-tools";
 import connectDB from "./src/config/db.js";
 import { buildTextNote } from "./src/services/nostr.service.js";
 import { mineEventPow } from "./src/services/pow.service.js";
-import pkg from "uuid";
+import { v4 as uuidv4 } from "uuid";
 import logUpdate from "log-update";
-const { v4: uuidv4 } = pkg;
 
 const API_BASE = process.env.API_URL || "http://localhost:3000";
 const IGNORE_OLD_MS = Number(process.env.IGNORE_OLD) || Infinity;

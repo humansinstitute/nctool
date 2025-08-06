@@ -8,8 +8,7 @@ import { NDKEvent, NDKKind } from "@nostr-dev-kit/ndk";
 import { nip19 } from "nostr-tools";
 import { asyncHandler } from "../middlewares/asyncHandler.js";
 import { getAllKeys } from "../services/identity.service.js";
-import pkg from "uuid";
-const { v4: uuidv4 } = pkg;
+import { v4 as uuidv4 } from "uuid";
 
 const DEFAULT_POW = Number(process.env.POW_BITS) || 20;
 const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 10000;

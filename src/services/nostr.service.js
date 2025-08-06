@@ -7,8 +7,18 @@ import { nip19, nip04 } from "nostr-tools";
 import { getAllKeys } from "./identity.service.js";
 import { mineEventPow } from "./pow.service.js";
 
-// Read and parse relay configurations from environment variables
-const nostrRelayMode = process.env.NOSTR_RELAY_MODE || "local"; // Default to 'local'
+// Read and parse relay configurations from environment variables with normalization
+const stripQuotes = (s) =>
+  typeof s === "string" ? s.replace(/^['"]|['"]$/g, "") : s;
+const stripInlineComment = (s) =>
+  typeof s === "string" ? s.split("#")[0] : s;
+const normalize = (s) => {
+  if (typeof s !== "string") return s;
+  return stripQuotes(stripInlineComment(s)).trim();
+};
+
+const rawMode = process.env.NOSTR_RELAY_MODE;
+const nostrRelayMode = (normalize(rawMode) || "local").toLowerCase();
 
 // Define default relay lists in case .env variables are not set
 const defaultLocalRelaysString = "ws://127.0.0.1:8021";
@@ -24,22 +34,30 @@ const defaultRemoteRelaysString = [
   "wss://relay.nostr.band",
 ].join(",");
 
-const localRelaysEnv =
-  process.env.NOSTR_LOCAL_RELAYS || defaultLocalRelaysString;
-const remoteRelaysEnv =
-  process.env.NOSTR_REMOTE_RELAYS || defaultRemoteRelaysString;
+const localRelaysEnv = normalize(process.env.NOSTR_LOCAL_RELAYS) || defaultLocalRelaysString;
+const remoteRelaysEnv = normalize(process.env.NOSTR_REMOTE_RELAYS) || defaultRemoteRelaysString;
 
 // Helper function to parse comma-separated strings into an array of URLs
 const parseRelayUrls = (urlsString) => {
   if (!urlsString) return [];
   return urlsString
     .split(",")
-    .map((url) => url.trim())
+    .map((url) => normalize(url))
     .filter((url) => url); // Remove any empty strings
 };
 
 const localRelayUrls = parseRelayUrls(localRelaysEnv);
 const remoteRelayUrls = parseRelayUrls(remoteRelaysEnv);
+
+// One-time diagnostics to aid debugging env loading issues
+console.log("Nostr Service ENV:", {
+  rawMode,
+  nostrRelayMode,
+  localRelaysEnv,
+  remoteRelaysEnv,
+  localRelayCount: localRelayUrls.length,
+  remoteRelayCount: remoteRelayUrls.length,
+});
 
 /**
  * Builds a basic Kind 1 Nostr text note event object.
