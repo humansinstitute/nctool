@@ -68,32 +68,21 @@ export const viewPosts = asyncHandler(async (req, res) => {
 });
 
 /**
- * HTTP handler to send a note (kind=Text) via API.
+ * Core service to post a note. Reused by HTTP controller and NostrMQ.
+ * @param {{ npub: string, content: string, powBits?: number, timeoutMs?: number }} params
+ * @returns {Promise<{ relays: string[], latestEvents: Array<{id:string,kind:number,content:string,created_at:number}> }>}
  */
-export const sendNoteController = asyncHandler(async (req, res) => {
-  const {
-    npub,
-    powBits = DEFAULT_POW,
-    timeoutMs = DEFAULT_TIMEOUT,
-    content,
-  } = req.body;
-  console.log(
-    `DEBUG sendNoteController: received npub=${npub}, content length=${content?.length}`
-  );
+export async function postNoteService({ npub, content, powBits = DEFAULT_POW, timeoutMs = DEFAULT_TIMEOUT }) {
   if (!npub || !content) {
-    console.log("DEBUG sendNoteController: missing npub or content");
-    return res.status(400).json({ error: "npub and content are required" });
+    throw Object.assign(new Error("npub and content are required"), { status: 400 });
   }
+
   const keys = await getAllKeys();
-  console.log(
-    `DEBUG sendNoteController: getAllKeys returned ${keys.length} entries`
-  );
-  console.log(
-    "DEBUG sendNoteController: available npubs:",
-    keys.map((k) => k.npub)
-  );
   const keyObj = keys.find((k) => k.npub === npub);
-  if (!keyObj) throw new Error("Unknown npub for note");
+  if (!keyObj) {
+    throw Object.assign(new Error("Unknown npub for note"), { status: 400 });
+  }
+
   const { ndk } = await connect(keyObj);
   const noteEvent = new NDKEvent(ndk, { kind: NDKKind.Text, content });
   await noteEvent.sign();
@@ -124,10 +113,28 @@ export const sendNoteController = asyncHandler(async (req, res) => {
       created_at: e.created_at,
     }));
 
-  res.json({
+  return {
     relays: [...okRelays].map((r) => r.url),
     latestEvents,
-  });
+  };
+}
+
+/**
+ * HTTP handler to send a note (kind=Text) via API.
+ */
+export const sendNoteController = asyncHandler(async (req, res) => {
+  const {
+    npub,
+    powBits = DEFAULT_POW,
+    timeoutMs = DEFAULT_TIMEOUT,
+    content,
+  } = req.body;
+  console.log(
+    `DEBUG sendNoteController: received npub=${npub}, content length=${content?.length}`
+  );
+
+  const result = await postNoteService({ npub, content, powBits, timeoutMs });
+  res.json(result);
 });
 
 /**

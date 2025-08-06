@@ -150,11 +150,70 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 - `POW_BITS`: Default proof-of-work difficulty (default: `20`)
 - `TIMEOUT_MS`: Default timeout for publishing events in milliseconds (default: `10000`)
 - `IGNORE_OLD`: Milliseconds threshold for ignoring old messages (default: no limit)
-
-## Documentation
-
-For more detailed information, please refer to:
-
-- [API Layer Documentation](./doc/apiLayer.md)
-- [Test Client Documentation](./doc/testClient.md)
-- [Cashu Wallet API Documentation](./doc/cashu-wallet-api.md)
++
++### NostrMQ Remote API (Phase 1: /post/note)
++- `NOSTR_MQ_CALL`: npub that this service will listen for via NostrMQ and use to decrypt messages
++- `NOSTRMQ_RELAYS`: Comma-separated relays used by NostrMQ receive/send (default: `wss://relay.damus.io,wss://relay.snort.social`)
++- `NOSTRMQ_POW_DIFFICULTY`: Optional PoW difficulty for outbound messages (reserved for future use)
++- `NOSTRMQ_POW_THREADS`: Optional PoW threads (reserved for future use)
++
++Example:
++```
++NOSTR_MQ_CALL="npub1xxxxx..."
++NOSTRMQ_RELAYS="wss://relay.damus.io,wss://relay.snort.social"
++```
++
++The private key corresponding to `NOSTR_MQ_CALL` must exist in the identities database (managed by identity.service).
++
++## NostrMQ Usage
++
++This server can be triggered via NostrMQ using encrypted messages instead of HTTP calls. Phase 1 supports the `/post/note` action:
++
++Incoming message payload:
++```json
++{
++  "action": "/post/note",
++  "data": {
++    "npub": "npub1...",
++    "content": "Hello Nostr!",
++    "powBits": 20,
++    "timeoutMs": 10000
++  }
++}
++```
++
++Success response payload:
++```json
++{
++  "success": true,
++  "action": "/post/note",
++  "data": {
++    "relays": ["wss://relay.damus.io"],
++    "latestEvents": [{ "id": "event_id", "kind": 1, "content": "Hello Nostr!", "created_at": 1714110000 }]
++  }
++}
++```
++
++Error response payload:
++```json
++{
++  "success": false,
++  "action": "/post/note",
++  "error": { "code": "ValidationError", "message": "Invalid npub format provided" }
++}
++```
++
++Implementation details:
++- NostrMQ listener initializes at startup and degrades gracefully if misconfigured
++- Messages are validated and routed to the existing post note logic
++- The HTTP API remains fully functional
++
++See also: [NostrMQ Documentation](./doc/nostrMQ.md)
+ 
+ ## Documentation
+ 
+ For more detailed information, please refer to:
+ 
+ - [API Layer Documentation](./doc/apiLayer.md)
+ - [Test Client Documentation](./doc/testClient.md)
+ - [Cashu Wallet API Documentation](./doc/cashu-wallet-api.md)
