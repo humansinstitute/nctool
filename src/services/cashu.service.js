@@ -211,6 +211,9 @@ async function initializeWallet(npub) {
       unit: walletDoc.wallet_config?.unit || "sat",
     });
 
+    // Load keysets to ensure fee calculations work properly
+    await wallet.loadMint();
+
     logger.info("Cashu wallet initialized successfully", {
       npub,
       mintUrl: workingUrl,
