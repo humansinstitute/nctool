@@ -21,7 +21,7 @@ import MonitoringService from "../services/monitoring.service.js";
 import RecoveryService from "../services/recovery.service.js";
 import { logger } from "../utils/logger.js";
 
-const MINT_URL = process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
+const MINT_URL = process.env.MINT_URL;
 
 /**
  * Creates a new eCash wallet for a user by publishing:

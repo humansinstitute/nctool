@@ -4,9 +4,81 @@ import { CashuMint, CashuWallet, getEncodedToken } from "@cashu/cashu-ts";
 import walletRepositoryService from "./walletRepository.service.js";
 import { logger } from "../utils/logger.js";
 
-// Initialize mint instance
-const MINT_URL = process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
-const mint = new CashuMint(MINT_URL);
+// Initialize mint instance using .env MINT_URL only
+const MINT_URL = process.env.MINT_URL;
+
+if (!MINT_URL) {
+  throw new Error("MINT_URL environment variable is required");
+}
+
+let mint = new CashuMint(MINT_URL);
+
+/**
+ * Test mint connectivity
+ * @returns {Promise<void>} Throws if mint is not accessible
+ */
+async function testMintConnectivity() {
+  try {
+    logger.info("Testing mint connectivity", { mintUrl: MINT_URL });
+    
+    // Test basic connectivity with timeout
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Connection timeout')), 10000)
+    );
+    
+    await Promise.race([
+      mint.getInfo(),
+      timeoutPromise
+    ]);
+    
+    logger.info("Mint connectivity test successful", { mintUrl: MINT_URL });
+  } catch (error) {
+    logger.error("Mint connectivity test failed", {
+      mintUrl: MINT_URL,
+      error: error.message,
+    });
+    throw new Error(`Mint ${MINT_URL} is not accessible: ${error.message}`);
+  }
+}
+
+/**
+ * Retry wrapper for mint operations with exponential backoff
+ * @param {Function} operation - Async operation to retry
+ * @param {string} operationName - Name for logging
+ * @param {number} maxRetries - Maximum retry attempts
+ * @returns {Promise<any>} Operation result
+ */
+async function retryMintOperation(operation, operationName, maxRetries = 3) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      logger.info(`Attempting ${operationName}`, { attempt, maxRetries });
+      
+      // Test mint connectivity before operation
+      await testMintConnectivity();
+      
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      logger.warn(`${operationName} failed`, {
+        attempt,
+        maxRetries,
+        error: error.message,
+        mintUrl: MINT_URL,
+      });
+      
+      // Exponential backoff (except on last attempt)
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+        logger.info(`Retrying ${operationName} in ${delay}ms`, { attempt: attempt + 1 });
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw new Error(`${operationName} failed after ${maxRetries} attempts: ${lastError.message}`);
+}
 
 /**
  * Generates a P2PK keypair for an eCash wallet.
@@ -103,11 +175,15 @@ export async function getWalletDetails(npub, nsec, ndk) {
  * @returns {Promise<CashuWallet>} Initialized wallet instance
  */
 async function initializeWallet(npub) {
-  try {
+  return await retryMintOperation(async () => {
     logger.info("Initializing Cashu wallet", { npub, mintUrl: MINT_URL });
 
-    // Find or create wallet in database
-    let walletDoc = await walletRepositoryService.findWallet(npub, MINT_URL);
+    // Use the existing global mint instance and URL
+    const workingMint = mint;
+    const workingUrl = MINT_URL;
+    
+    // Find or create wallet in database (use working mint URL)
+    let walletDoc = await walletRepositoryService.findWallet(npub, workingUrl);
 
     if (!walletDoc) {
       // Generate new P2PK keypair for wallet
@@ -116,7 +192,7 @@ async function initializeWallet(npub) {
       // Create wallet in database
       walletDoc = await walletRepositoryService.createWallet({
         npub,
-        mint_url: MINT_URL,
+        mint_url: workingUrl,
         p2pk_pubkey: pubkey,
         p2pk_privkey: privkey, // In production, this should be encrypted
         wallet_config: { unit: "sat" },
@@ -126,27 +202,21 @@ async function initializeWallet(npub) {
         npub,
         walletId: walletDoc._id,
         p2pkPubkey: pubkey,
+        mintUrl: workingUrl,
       });
     }
 
-    // Initialize CashuWallet instance
-    const wallet = new CashuWallet(mint, {
+    // Initialize CashuWallet instance with working mint
+    const wallet = new CashuWallet(workingMint, {
       unit: walletDoc.wallet_config?.unit || "sat",
     });
 
     logger.info("Cashu wallet initialized successfully", {
       npub,
-      mintUrl: MINT_URL,
+      mintUrl: workingUrl,
     });
     return { wallet, walletDoc };
-  } catch (error) {
-    logger.error("Failed to initialize Cashu wallet", {
-      npub,
-      mintUrl: MINT_URL,
-      error: error.message,
-    });
-    throw new Error(`Failed to initialize wallet: ${error.message}`);
-  }
+  }, "wallet initialization");
 }
 
 /**
@@ -156,19 +226,36 @@ async function initializeWallet(npub) {
  * @returns {Promise<Object>} Mint result with quote and proofs
  */
 export async function mintTokens(npub, amount) {
-  try {
+  return await retryMintOperation(async () => {
     logger.info("Starting mint tokens operation", { npub, amount });
 
     const { wallet, walletDoc } = await initializeWallet(npub);
 
-    // Create mint quote
-    const mintQuote = await wallet.createMintQuote(amount);
-    logger.info("Created mint quote", {
-      npub,
-      amount,
-      quoteId: mintQuote.quote,
-      invoice: mintQuote.request,
-    });
+    // Create mint quote with enhanced error logging
+    let mintQuote;
+    try {
+      logger.info("Creating mint quote", { npub, amount, mintUrl: MINT_URL });
+      mintQuote = await wallet.createMintQuote(amount);
+      logger.info("Created mint quote successfully", {
+        npub,
+        amount,
+        quoteId: mintQuote.quote,
+        invoice: mintQuote.request.substring(0, 50) + "...",
+        mintUrl: MINT_URL,
+      });
+    } catch (quoteError) {
+      logger.error("Failed to create mint quote - detailed error", {
+        npub,
+        amount,
+        mintUrl: MINT_URL,
+        errorName: quoteError.name,
+        errorMessage: quoteError.message,
+        errorStack: quoteError.stack?.split('\n')[0],
+        errorCause: quoteError.cause,
+        errorCode: quoteError.code,
+      });
+      throw quoteError;
+    }
 
     // Generate transaction ID
     const transactionId = walletRepositoryService.generateTransactionId("mint");
@@ -188,6 +275,7 @@ export async function mintTokens(npub, amount) {
         mint_amount: amount,
         invoice: mintQuote.request,
         expiry: mintQuote.expiry,
+        mint_url_used: MINT_URL,
       },
     });
 
@@ -196,6 +284,7 @@ export async function mintTokens(npub, amount) {
       quoteId: mintQuote.quote,
       transactionId,
       amount,
+      mintUrl: MINT_URL,
     });
 
     // Start background polling for payment completion
@@ -216,14 +305,7 @@ export async function mintTokens(npub, amount) {
       expiry: mintQuote.expiry,
       mintUrl: MINT_URL,
     };
-  } catch (error) {
-    logger.error("Failed to create mint quote", {
-      npub,
-      amount,
-      error: error.message,
-    });
-    throw new Error(`Failed to mint tokens: ${error.message}`);
-  }
+  }, "mint tokens operation");
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   getAllKeys,
   generateKeyPair,
   getPrivateKeyByNpub,
+  importKeyFromNsec,
 } from "./src/services/identity.service.js";
 import { nip19, finalizeEvent } from "nostr-tools";
 import connectDB from "./src/config/db.js";
@@ -45,11 +46,61 @@ async function chooseKey() {
     console.log("\nSelect a user:");
     keys.forEach((k, i) => console.log(`${i + 1}) ${k.name}`));
     console.log("n) Create new user");
-    const choice = await prompt("Enter number or n: ");
+    console.log("i) Import existing key");
+    const choice = await prompt("Enter number, n, or i: ");
+    
     if (choice.toLowerCase() === "n") {
       const name = await prompt("Enter a name for the new user: ");
       return generateKeyPair(name, "61487097701@c.us");
     }
+    
+    if (choice.toLowerCase() === "i") {
+      try {
+        // Security warning
+        console.log("\n⚠️  SECURITY WARNING:");
+        console.log("Only import your private key (nsec) on a computer you trust.");
+        console.log("Never share your nsec with anyone or enter it on untrusted devices.");
+        const confirmImport = await prompt("Continue? (y/n) ");
+        
+        if (confirmImport.toLowerCase() !== "y") {
+          console.log("Import cancelled.");
+          return chooseKey();
+        }
+        
+        // Get nsec input
+        const nsec = await prompt("Enter your nsec private key: ");
+        if (!nsec || !nsec.trim()) {
+          console.log("❌ nsec is required. Returning to menu.");
+          return chooseKey();
+        }
+        
+        // Get name input
+        const name = await prompt("Enter a name/label for this identity: ");
+        if (!name || !name.trim()) {
+          console.log("❌ Name is required. Returning to menu.");
+          return chooseKey();
+        }
+        
+        // Import the key
+        const importedIdentity = await importKeyFromNsec(name.trim(), nsec.trim());
+        
+        // Clear sensitive data
+        const clearedNsec = nsec;
+        clearedNsec.replace(/./g, '0');
+        
+        // Success message
+        console.log(`✅ Successfully imported identity: ${importedIdentity.name}`);
+        console.log(`   NPub: ${importedIdentity.npub}`);
+        
+        return importedIdentity;
+        
+      } catch (error) {
+        console.log(`❌ Import failed: ${error.message}`);
+        console.log("Returning to menu.");
+        return chooseKey();
+      }
+    }
+    
     const idx = parseInt(choice, 10) - 1;
     if (idx >= 0 && idx < keys.length) return keys[idx];
     console.log("Invalid selection, try again.");

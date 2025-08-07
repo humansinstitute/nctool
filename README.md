@@ -154,6 +154,9 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 +### NostrMQ Remote API (Phase 1: /post/note)
 +- `NOSTR_MQ_CALL`: npub that this service will listen for via NostrMQ and use to decrypt messages
 +- `NOSTRMQ_RELAYS`: Comma-separated relays used by NostrMQ receive/send (default: `wss://relay.damus.io,wss://relay.snort.social`)
+- `NOSTRMQ_ENABLE_DEDUP`: Enable duplicate message prevention (default: `true`)
+- `NOSTRMQ_SINCE_HOURS`: Only process messages from last N hours (default: `24`)
+- `NOSTRMQ_MAX_CACHE_SIZE`: Maximum number of event IDs to cache for duplicate detection (default: `10000`)
 +- `NOSTRMQ_POW_DIFFICULTY`: Optional PoW difficulty for outbound messages (reserved for future use)
 +- `NOSTRMQ_POW_THREADS`: Optional PoW threads (reserved for future use)
 +
@@ -161,6 +164,9 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 +```
 +NOSTR_MQ_CALL="npub1xxxxx..."
 +NOSTRMQ_RELAYS="wss://relay.damus.io,wss://relay.snort.social"
+NOSTRMQ_ENABLE_DEDUP="true"
+NOSTRMQ_SINCE_HOURS="24"
+NOSTRMQ_MAX_CACHE_SIZE="10000"
 +```
 +
 +The private key corresponding to `NOSTR_MQ_CALL` must exist in the identities database (managed by identity.service).
@@ -205,6 +211,30 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 +
 +Implementation details:
 +- NostrMQ listener initializes at startup and degrades gracefully if misconfigured
+### Duplicate Message Prevention
+
+NostrMQ includes built-in duplicate prevention to avoid processing the same message multiple times:
+
+- **Library-level deduplication**: Uses NostrMQ's native `since` and `deduplication` options
+- **Application-level tracking**: Maintains an in-memory cache of processed event IDs
+- **Automatic cleanup**: Periodically removes old entries from the cache
+- **Error recovery**: Removes failed events from cache to allow retry
+
+Configuration:
+- Set `NOSTRMQ_ENABLE_DEDUP=false` to disable duplicate prevention
+- Adjust `NOSTRMQ_SINCE_HOURS` to change the time window for processing messages
+- Modify `NOSTRMQ_MAX_CACHE_SIZE` to control memory usage for event ID caching
+
+When duplicate prevention is enabled, you'll see console output showing:
+```
+DEDUPLICATION: enabled
+SINCE: 24 hours ago
+```
+
+Duplicate events are logged and skipped:
+```
+Skipping duplicate NostrMQ event: <event_id>
+```
 +- Messages are validated and routed to the existing post note logic
 +- The HTTP API remains fully functional
 +

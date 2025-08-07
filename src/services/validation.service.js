@@ -162,8 +162,11 @@ class ValidationService {
    */
   static async validateWalletExists(npub) {
     try {
-      const MINT_URL =
-        process.env.MINT_URL || "https://mint.minibits.cash/Bitcoin";
+      const MINT_URL = process.env.MINT_URL;
+      
+      if (!MINT_URL) {
+        throw new Error("MINT_URL environment variable is required");
+      }
       const wallet = await walletRepositoryService.findWallet(npub, MINT_URL);
 
       if (!wallet) {
