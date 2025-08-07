@@ -22,6 +22,7 @@
     "log-update": "^6.1.0",
     "mongoose": "^8.14.1",
     "morgan": "^1.10.0",
+    "node-fetch": "^3.3.2",
     "nostr-tools": "^2.12.0",
     "nostrmq": "^0.4.0",
     "uuid": "^11.0.3",
