@@ -237,9 +237,9 @@ export const getBalance = asyncHandler(async (req, res) => {
 
     res.json({
       success: true,
-      balance: balance.total_balance, // Client expects this to be a number
+      balance: balance.unspent_balance, // Client expects this to be a number
       details: {
-        totalBalance: balance.total_balance,
+        totalBalance: balance.unspent_balance,
         unspentBalance: balance.unspent_balance,
         pendingBalance: balance.pending_balance,
         spentBalance: balance.spent_balance,
@@ -904,7 +904,7 @@ export const getWalletInfo = asyncHandler(async (req, res) => {
     const walletInfo = {
       npub,
       mintUrl: MINT_URL,
-      balance: balance.total_balance, // Extract just the total balance number for client compatibility
+      balance: balance.unspent_balance, // Extract just the unspent balance number for client compatibility
       statistics: walletStats,
       walletDetails: walletDetails
         ? {
