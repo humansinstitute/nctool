@@ -1069,12 +1069,15 @@ export async function receiveTokens(npub, encodedToken, privateKey = null) {
  * @returns {Promise<Object>} Payment result and change information
  */
 export async function meltTokens(npub, invoice) {
+  const operationStart = Date.now();
+  
   try {
     logger.info(
-      "Starting atomic melt tokens operation with state consistency",
+      "Starting enhanced melt tokens operation with pre-flight reconciliation and atomic transactions",
       {
         npub,
         invoice: invoice.substring(0, 50) + "...",
+        timestamp: new Date().toISOString(),
       }
     );
 
@@ -1127,16 +1130,68 @@ export async function meltTokens(npub, invoice) {
       tokenIds.push(token._id);
     }
 
-    logger.info("All proofs verified as unspent, proceeding with melt", {
+    logger.info("All proofs collected, starting pre-flight reconciliation", {
       npub,
       allProofsCount: allProofs.length,
       totalAmount: allProofs.reduce((sum, p) => sum + (p.amount || 0), 0),
     });
 
-    // Send the required amount for melting with enhanced error handling
+    // CRITICAL: Pre-flight reconciliation to ensure proof state consistency
+    try {
+      const reconciliationResult = await performPreFlightReconciliation(npub, allProofs);
+      
+      if (!reconciliationResult.operationCleared) {
+        const error = new Error(
+          `Melt operation blocked due to critical proof state discrepancies. ` +
+          `Database state inconsistent with mint ground truth. ` +
+          `Please contact support for manual reconciliation.`
+        );
+        error.code = 'MELT_BLOCKED_BY_RECONCILIATION';
+        error.reconciliationResult = reconciliationResult;
+        throw error;
+      }
+      
+      logger.info('Pre-flight reconciliation completed successfully', {
+        npub,
+        discrepanciesFound: reconciliationResult.discrepanciesFound,
+        discrepanciesResolved: reconciliationResult.discrepanciesResolved || false,
+        operationCleared: reconciliationResult.operationCleared,
+      });
+      
+    } catch (reconciliationError) {
+      if (reconciliationError.code === 'HIGH_SEVERITY_DISCREPANCIES' ||
+          reconciliationError.code === 'MELT_BLOCKED_BY_RECONCILIATION') {
+        logger.error('CRITICAL: Melt operation blocked by pre-flight reconciliation', {
+          npub,
+          error: reconciliationError.message,
+          discrepancies: reconciliationError.discrepancies || [],
+          reconciliationResult: reconciliationError.reconciliationResult,
+        });
+        
+        // Re-throw with enhanced context for user
+        const userError = new Error(
+          `Cannot proceed with Lightning payment. Critical proof state inconsistencies detected. ` +
+          `This protects your funds from potential loss. Please try again in a few minutes or contact support.`
+        );
+        userError.code = 'PROOF_STATE_INCONSISTENCY';
+        userError.severity = 'CRITICAL';
+        userError.originalError = reconciliationError;
+        throw userError;
+      }
+      
+      // Re-throw other reconciliation errors
+      logger.error('Pre-flight reconciliation failed with unexpected error', {
+        npub,
+        error: reconciliationError.message,
+        stack: reconciliationError.stack?.split('\n').slice(0, 5),
+      });
+      throw new Error(`Pre-flight validation failed: ${reconciliationError.message}`);
+    }
+
+    // Split proofs for payment with includeFees
     let send, keep;
     try {
-      logger.info("Creating send transaction for melt", {
+      logger.info("Creating send transaction for melt with fee inclusion", {
         totalNeeded,
         proofsCount: allProofs.length,
       });
@@ -1150,17 +1205,20 @@ export async function meltTokens(npub, invoice) {
       logger.info("Send transaction created successfully", {
         sendProofs: send.length,
         keepProofs: keep.length,
+        sendAmount: send.reduce((sum, p) => sum + p.amount, 0),
+        keepAmount: keep.reduce((sum, p) => sum + p.amount, 0),
       });
     } catch (sendError) {
-      logger.error("Send transaction failed", {
+      logger.error("CRITICAL: Send transaction failed after successful reconciliation", {
         npub,
         error: sendError.message,
         errorName: sendError.name,
         errorCode: sendError.code,
         stack: sendError.stack?.split("\n").slice(0, 5),
+        severity: 'CRITICAL',
       });
       throw new Error(
-        `Failed to create send transaction: ${sendError.message}`
+        `Failed to prepare payment transaction: ${sendError.message}`
       );
     }
 
@@ -1182,92 +1240,157 @@ export async function meltTokens(npub, invoice) {
         changeProofs: meltResponse.change?.length || 0,
       });
     } catch (meltError) {
-      logger.error("Melt operation failed", {
+      logger.error("CRITICAL: Melt operation failed - mint may have consumed proofs", {
         npub,
         quoteId: meltQuote.quote,
         error: meltError.message,
         errorName: meltError.name,
+        severity: 'CRITICAL',
+        context: 'MINT_SUCCESS_DB_FAILURE_RISK',
       });
-      throw new Error(`Melt operation failed: ${meltError.message}`);
+      
+      // This is a critical scenario - the mint operation may have succeeded
+      // but we can't update our database. Mark this for manual investigation.
+      const criticalError = new Error(
+        `Lightning payment may have succeeded but local state update failed. ` +
+        `Please check your Lightning wallet and contact support immediately. ` +
+        `Quote ID: ${meltQuote.quote}`
+      );
+      criticalError.code = 'CRITICAL_MELT_FAILURE';
+      criticalError.severity = 'CRITICAL';
+      criticalError.quoteId = meltQuote.quote;
+      criticalError.originalError = meltError;
+      throw criticalError;
     }
 
-    // Generate transaction ID
+    // Generate transaction ID for atomic operation
     const transactionId = walletRepositoryService.generateTransactionId("melt");
 
-    // Mark spent tokens as spent
-    await walletRepositoryService.markTokensAsSpent(tokenIds);
-
-    // Store melted tokens record for transaction history
-    await walletRepositoryService.storeTokens({
-      npub,
-      wallet_id: walletDoc._id,
-      proofs: send,
-      mint_url: MINT_URL,
-      transaction_type: "melted",
-      transaction_id: transactionId,
-      metadata: {
-        source: "lightning",
-        quote_id: meltQuote.quote,
-        invoice_amount: meltQuote.amount,
-        fee_reserve: meltQuote.fee_reserve,
-        total_amount: totalNeeded,
-      },
-    });
-
-    // Store change tokens (from send operation)
-    if (keep.length > 0) {
-      await walletRepositoryService.storeTokens({
+    // CRITICAL: Execute atomic melt transaction - replaces all sequential operations
+    try {
+      logger.info("Executing atomic melt transaction", {
         npub,
-        wallet_id: walletDoc._id,
-        proofs: keep,
-        mint_url: MINT_URL,
-        transaction_type: "change",
-        transaction_id: transactionId,
-        metadata: {
-          source: "change",
-          original_amount: selection.total_selected,
-          melt_amount: totalNeeded,
-          change_from_selection: true,
-        },
+        transactionId,
+        sourceTokensCount: tokenIds.length,
+        keepProofsCount: keep.length,
+        meltChangeProofsCount: meltResponse.change?.length || 0,
       });
-    }
 
-    // Store change tokens from melt operation if any
-    if (meltResponse.change && meltResponse.change.length > 0) {
-      await walletRepositoryService.storeTokens({
-        npub,
-        wallet_id: walletDoc._id,
-        proofs: meltResponse.change,
-        mint_url: MINT_URL,
-        transaction_type: "change",
-        transaction_id: transactionId,
-        metadata: {
-          source: "change",
-          change_from_melt: true,
+      const atomicResult = await walletRepositoryService.executeAtomicMelt(
+        tokenIds,
+        keep,
+        meltResponse.change || [],
+        transactionId,
+        {
+          npub,
+          wallet_id: walletDoc._id,
+          mint_url: MINT_URL,
+          parent_transaction_id: transactionId,
           quote_id: meltQuote.quote,
-        },
+          invoice_amount: meltQuote.amount,
+          fee_reserve: meltQuote.fee_reserve,
+          total_amount: totalNeeded,
+          payment_result: meltResponse.state,
+        }
+      );
+
+      logger.info("Atomic melt transaction completed successfully", {
+        npub,
+        transactionId,
+        sourceTokensSpent: atomicResult.source_tokens_spent,
+        keepTokenId: atomicResult.keep_token_id,
+        keepAmount: atomicResult.keep_amount,
+        meltChangeTokenId: atomicResult.melt_change_token_id,
+        meltChangeAmount: atomicResult.melt_change_amount,
+        operationsPerformed: atomicResult.operations.length,
       });
+
+      const operationDuration = Date.now() - operationStart;
+      logger.info("Enhanced melt tokens operation completed successfully", {
+        npub,
+        transactionId,
+        quoteId: meltQuote.quote,
+        paymentResult: meltResponse.state,
+        operationDuration: `${operationDuration}ms`,
+        totalChangeAmount: atomicResult.keep_amount + atomicResult.melt_change_amount,
+      });
+
+      return {
+        transactionId,
+        paymentResult: meltResponse.state,
+        paidAmount: meltQuote.amount,
+        feesPaid: meltQuote.fee_reserve,
+        changeAmount: atomicResult.keep_amount + atomicResult.melt_change_amount,
+        quoteId: meltQuote.quote,
+        atomicResult,
+        operationDuration,
+      };
+
+    } catch (atomicError) {
+      // CRITICAL: Mint succeeded but database update failed
+      logger.error("CRITICAL: Atomic melt transaction failed after successful mint operation", {
+        npub,
+        transactionId,
+        quoteId: meltQuote.quote,
+        paymentResult: meltResponse.state,
+        error: atomicError.message,
+        severity: 'CRITICAL',
+        context: 'MINT_SUCCESS_DB_FAILURE',
+        requiresManualIntervention: true,
+      });
+
+      // This is the most critical error scenario - payment succeeded but we can't update state
+      const criticalError = new Error(
+        `CRITICAL: Lightning payment succeeded but database update failed. ` +
+        `Your payment was processed but local wallet state is inconsistent. ` +
+        `Please contact support immediately with Quote ID: ${meltQuote.quote} ` +
+        `and Transaction ID: ${transactionId}`
+      );
+      criticalError.code = 'CRITICAL_DB_FAILURE_AFTER_MINT_SUCCESS';
+      criticalError.severity = 'CRITICAL';
+      criticalError.quoteId = meltQuote.quote;
+      criticalError.transactionId = transactionId;
+      criticalError.paymentResult = meltResponse.state;
+      criticalError.requiresManualIntervention = true;
+      criticalError.originalError = atomicError;
+      throw criticalError;
     }
 
-    return {
-      transactionId,
-      paymentResult: meltResponse.state,
-      paidAmount: meltQuote.amount,
-      feesPaid: meltQuote.fee_reserve,
-      changeAmount:
-        keep.reduce((sum, p) => sum + p.amount, 0) +
-        (meltResponse.change?.reduce((sum, p) => sum + p.amount, 0) || 0),
-      quoteId: meltQuote.quote,
-    };
   } catch (error) {
-    logger.error("Atomic melt tokens operation failed", {
+    const operationDuration = Date.now() - operationStart;
+    
+    // Enhanced error logging with severity classification
+    const errorContext = {
       npub,
       invoice: invoice.substring(0, 50) + "...",
-      error: error.message,
-      errorType: error.constructor.name,
-    });
+      operationDuration: `${operationDuration}ms`,
+      error: {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        severity: error.severity || 'HIGH',
+        stack: error.stack?.split("\n").slice(0, 5),
+      },
+      timestamp: new Date().toISOString(),
+    };
 
-    throw new Error(`Failed to melt tokens: ${error.message}`);
+    // Log with appropriate severity
+    if (error.severity === 'CRITICAL') {
+      logger.error("CRITICAL: Enhanced melt tokens operation failed with critical error", errorContext);
+    } else {
+      logger.error("Enhanced melt tokens operation failed", errorContext);
+    }
+
+    // Preserve error context for upstream handling
+    if (error.code && ['PROOF_STATE_INCONSISTENCY', 'CRITICAL_MELT_FAILURE', 'CRITICAL_DB_FAILURE_AFTER_MINT_SUCCESS'].includes(error.code)) {
+      throw error; // Re-throw critical errors with full context
+    }
+
+    // Wrap other errors with enhanced context
+    const enhancedError = new Error(`Failed to melt tokens: ${error.message}`);
+    enhancedError.originalError = error;
+    enhancedError.operationDuration = operationDuration;
+    throw enhancedError;
   }
 }
 
@@ -1307,9 +1430,10 @@ export async function getBalance(npub) {
 
 /**
  * Verify proof states with mint and detect discrepancies with database
+ * Enhanced with severity-based discrepancy detection for pre-flight reconciliation
  * @param {string} npub - User's Nostr npub string
  * @param {Array} [proofs] - Optional specific proofs to check, otherwise checks all unspent
- * @returns {Promise<Object>} Proof states and any discrepancies
+ * @returns {Promise<Object>} Proof states and discrepancies with severity levels
  */
 export async function checkProofStates(npub, proofs = null) {
   try {
@@ -1321,6 +1445,7 @@ export async function checkProofStates(npub, proofs = null) {
     const { wallet } = await initializeWallet(npub);
 
     let proofsToCheck = proofs;
+    let dbTokenMap = new Map(); // Map proof secrets to database token info
 
     // If no specific proofs provided, get all unspent tokens
     if (!proofsToCheck) {
@@ -1333,6 +1458,33 @@ export async function checkProofStates(npub, proofs = null) {
       for (const token of unspentTokens) {
         for (const proof of token.proofs) {
           proofsToCheck.push(proof);
+          // Map proof secret to database token info
+          dbTokenMap.set(proof.secret, {
+            token_id: token._id,
+            status: token.status,
+            spent_at: token.spent_at,
+            created_at: token.created_at,
+            transaction_type: token.transaction_type,
+          });
+        }
+      }
+    } else {
+      // For custom proofs, we need to check their database status
+      const secrets = proofsToCheck.map(p => p.secret);
+      const secretMap = await walletRepositoryService.checkProofSecrets(secrets);
+      
+      for (const proof of proofsToCheck) {
+        if (secretMap[proof.secret]) {
+          dbTokenMap.set(proof.secret, secretMap[proof.secret]);
+        } else {
+          // Proof not found in database - this is a discrepancy
+          dbTokenMap.set(proof.secret, {
+            token_id: null,
+            status: 'unknown',
+            spent_at: null,
+            created_at: null,
+            transaction_type: null,
+          });
         }
       }
     }
@@ -1346,13 +1498,14 @@ export async function checkProofStates(npub, proofs = null) {
         pendingCount: 0,
         discrepancies: [],
         consistent: true,
+        severityCounts: { HIGH: 0, MEDIUM: 0, LOW: 0 },
       };
     }
 
     // Check proof states with mint
     const states = await wallet.checkProofsStates(proofsToCheck);
 
-    // Analyze states
+    // Analyze states and detect discrepancies
     const stateAnalysis = {
       UNSPENT: 0,
       SPENT: 0,
@@ -1360,21 +1513,115 @@ export async function checkProofStates(npub, proofs = null) {
     };
 
     const discrepancies = [];
+    const severityCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
 
     states.forEach((state, index) => {
-      stateAnalysis[state.state]++;
+      const proof = proofsToCheck[index];
+      const dbInfo = dbTokenMap.get(proof.secret);
+      const mintState = state.state;
+      const dbStatus = dbInfo?.status || 'unknown';
+
+      stateAnalysis[mintState]++;
+
+      // Detect discrepancies with severity levels
+      let discrepancy = null;
+
+      if (dbStatus === 'unspent' && mintState === 'SPENT') {
+        // HIGH severity: DB says unspent, mint says SPENT (critical - blocks operations)
+        discrepancy = {
+          severity: 'HIGH',
+          type: 'DB_UNSPENT_MINT_SPENT',
+          description: 'Database shows proof as unspent but mint shows as spent',
+          proof_secret: proof.secret,
+          proof_amount: proof.amount,
+          db_status: dbStatus,
+          mint_state: mintState,
+          token_id: dbInfo?.token_id,
+          action_required: 'BLOCK_OPERATION',
+          recommendation: 'Update database to mark proof as spent immediately',
+        };
+        severityCounts.HIGH++;
+      } else if (dbStatus === 'spent' && mintState === 'UNSPENT') {
+        // MEDIUM severity: DB says spent, mint says UNSPENT (requires investigation)
+        discrepancy = {
+          severity: 'MEDIUM',
+          type: 'DB_SPENT_MINT_UNSPENT',
+          description: 'Database shows proof as spent but mint shows as unspent',
+          proof_secret: proof.secret,
+          proof_amount: proof.amount,
+          db_status: dbStatus,
+          mint_state: mintState,
+          token_id: dbInfo?.token_id,
+          spent_at: dbInfo?.spent_at,
+          action_required: 'INVESTIGATE',
+          recommendation: 'Investigate transaction history and potentially restore proof to unspent',
+        };
+        severityCounts.MEDIUM++;
+      } else if (dbStatus === 'pending' && mintState === 'SPENT') {
+        // MEDIUM severity: DB says pending, mint says SPENT
+        discrepancy = {
+          severity: 'MEDIUM',
+          type: 'DB_PENDING_MINT_SPENT',
+          description: 'Database shows proof as pending but mint shows as spent',
+          proof_secret: proof.secret,
+          proof_amount: proof.amount,
+          db_status: dbStatus,
+          mint_state: mintState,
+          token_id: dbInfo?.token_id,
+          action_required: 'UPDATE_STATUS',
+          recommendation: 'Update database status from pending to spent',
+        };
+        severityCounts.MEDIUM++;
+      } else if (dbStatus === 'unknown') {
+        // LOW severity: Proof not found in database
+        discrepancy = {
+          severity: 'LOW',
+          type: 'PROOF_NOT_IN_DB',
+          description: 'Proof exists but not found in database',
+          proof_secret: proof.secret,
+          proof_amount: proof.amount,
+          db_status: dbStatus,
+          mint_state: mintState,
+          token_id: null,
+          action_required: 'LOG_ONLY',
+          recommendation: 'Log for audit purposes - may be external proof',
+        };
+        severityCounts.LOW++;
+      } else if (dbStatus === 'unspent' && mintState === 'PENDING') {
+        // LOW severity: Minor state mismatch
+        discrepancy = {
+          severity: 'LOW',
+          type: 'DB_UNSPENT_MINT_PENDING',
+          description: 'Database shows proof as unspent but mint shows as pending',
+          proof_secret: proof.secret,
+          proof_amount: proof.amount,
+          db_status: dbStatus,
+          mint_state: mintState,
+          token_id: dbInfo?.token_id,
+          action_required: 'MONITOR',
+          recommendation: 'Monitor for state resolution - may be temporary',
+        };
+        severityCounts.LOW++;
+      }
+
+      if (discrepancy) {
+        discrepancies.push(discrepancy);
+      }
     });
 
     const isConsistent = discrepancies.length === 0;
+    const hasHighSeverity = severityCounts.HIGH > 0;
 
-    logger.info("Completed enhanced proof state check", {
+    logger.info("Completed enhanced proof state check with discrepancy analysis", {
       npub,
       totalProofs: proofsToCheck.length,
       unspentCount: stateAnalysis.UNSPENT,
       spentCount: stateAnalysis.SPENT,
       pendingCount: stateAnalysis.PENDING,
       discrepancyCount: discrepancies.length,
+      severityCounts,
       consistent: isConsistent,
+      hasHighSeverity,
     });
 
     return {
@@ -1384,16 +1631,442 @@ export async function checkProofStates(npub, proofs = null) {
       unspentCount: stateAnalysis.UNSPENT,
       pendingCount: stateAnalysis.PENDING,
       discrepancies,
+      severityCounts,
       consistent: isConsistent,
+      hasHighSeverity,
       mintUrl: MINT_URL,
+      timestamp: new Date().toISOString(),
     };
   } catch (error) {
     logger.error("Failed to check proof states", {
       npub,
       customProofs: !!proofs,
       error: error.message,
+      stack: error.stack?.split('\n').slice(0, 5),
     });
     throw new Error(`Failed to check proof states: ${error.message}`);
+  }
+}
+
+/**
+ * Reconcile proof state discrepancies by automatically correcting database inconsistencies
+ * Blocks operations when HIGH severity discrepancies are detected
+ * @param {string} npub - User's Nostr npub string
+ * @param {Array} discrepancies - Array of discrepancy objects from checkProofStates
+ * @returns {Promise<Object>} Reconciliation results with actions taken
+ */
+export async function reconcileProofStates(npub, discrepancies) {
+  try {
+    logger.info("Starting proof state reconciliation", {
+      npub,
+      discrepancyCount: discrepancies.length,
+      severityBreakdown: discrepancies.reduce((acc, d) => {
+        acc[d.severity] = (acc[d.severity] || 0) + 1;
+        return acc;
+      }, {}),
+    });
+
+    if (!discrepancies || discrepancies.length === 0) {
+      return {
+        success: true,
+        actionsPerformed: [],
+        highSeverityBlocked: false,
+        reconciliationSummary: {
+          totalDiscrepancies: 0,
+          resolved: 0,
+          blocked: 0,
+          failed: 0,
+        },
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    // Check for HIGH severity discrepancies that should block operations
+    const highSeverityDiscrepancies = discrepancies.filter(d => d.severity === 'HIGH');
+    
+    if (highSeverityDiscrepancies.length > 0) {
+      logger.error("HIGH severity discrepancies detected - blocking operation", {
+        npub,
+        highSeverityCount: highSeverityDiscrepancies.length,
+        discrepancies: highSeverityDiscrepancies.map(d => ({
+          type: d.type,
+          proof_secret: d.proof_secret.substring(0, 10) + '...',
+          proof_amount: d.proof_amount,
+        })),
+      });
+
+      // For HIGH severity, we still attempt to fix them but block the operation
+      const highSeverityActions = [];
+      
+      for (const discrepancy of highSeverityDiscrepancies) {
+        try {
+          if (discrepancy.type === 'DB_UNSPENT_MINT_SPENT' && discrepancy.token_id) {
+            // Update database to mark token as spent
+            const updateResult = await walletRepositoryService.markTokensAsSpent([discrepancy.token_id]);
+            
+            highSeverityActions.push({
+              discrepancy_type: discrepancy.type,
+              action: 'MARKED_TOKEN_AS_SPENT',
+              token_id: discrepancy.token_id,
+              proof_amount: discrepancy.proof_amount,
+              success: updateResult > 0,
+              timestamp: new Date().toISOString(),
+            });
+
+            logger.info("Corrected HIGH severity discrepancy", {
+              npub,
+              type: discrepancy.type,
+              token_id: discrepancy.token_id,
+              action: 'MARKED_TOKEN_AS_SPENT',
+            });
+          }
+        } catch (error) {
+          logger.error("Failed to correct HIGH severity discrepancy", {
+            npub,
+            discrepancy_type: discrepancy.type,
+            token_id: discrepancy.token_id,
+            error: error.message,
+          });
+
+          highSeverityActions.push({
+            discrepancy_type: discrepancy.type,
+            action: 'CORRECTION_FAILED',
+            token_id: discrepancy.token_id,
+            error: error.message,
+            success: false,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      return {
+        success: false,
+        blocked: true,
+        reason: 'HIGH_SEVERITY_DISCREPANCIES_DETECTED',
+        highSeverityBlocked: true,
+        actionsPerformed: highSeverityActions,
+        reconciliationSummary: {
+          totalDiscrepancies: discrepancies.length,
+          resolved: highSeverityActions.filter(a => a.success).length,
+          blocked: highSeverityDiscrepancies.length,
+          failed: highSeverityActions.filter(a => !a.success).length,
+        },
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    // Process MEDIUM and LOW severity discrepancies
+    const actionsPerformed = [];
+    let resolvedCount = 0;
+    let failedCount = 0;
+
+    for (const discrepancy of discrepancies) {
+      try {
+        let action = null;
+
+        switch (discrepancy.type) {
+          case 'DB_SPENT_MINT_UNSPENT':
+            // MEDIUM: Investigate and potentially restore proof to unspent
+            // For now, we log this for manual investigation
+            action = {
+              discrepancy_type: discrepancy.type,
+              action: 'LOGGED_FOR_INVESTIGATION',
+              token_id: discrepancy.token_id,
+              proof_amount: discrepancy.proof_amount,
+              recommendation: discrepancy.recommendation,
+              success: true,
+              timestamp: new Date().toISOString(),
+            };
+            
+            logger.warn("MEDIUM severity discrepancy logged for investigation", {
+              npub,
+              type: discrepancy.type,
+              token_id: discrepancy.token_id,
+              spent_at: discrepancy.spent_at,
+            });
+            break;
+
+          case 'DB_PENDING_MINT_SPENT':
+            // MEDIUM: Update database status from pending to spent
+            if (discrepancy.token_id) {
+              const updateResult = await walletRepositoryService.markTokensAsSpent([discrepancy.token_id]);
+              
+              action = {
+                discrepancy_type: discrepancy.type,
+                action: 'UPDATED_PENDING_TO_SPENT',
+                token_id: discrepancy.token_id,
+                proof_amount: discrepancy.proof_amount,
+                success: updateResult > 0,
+                timestamp: new Date().toISOString(),
+              };
+
+              if (updateResult > 0) {
+                resolvedCount++;
+                logger.info("Resolved MEDIUM severity discrepancy", {
+                  npub,
+                  type: discrepancy.type,
+                  token_id: discrepancy.token_id,
+                  action: 'UPDATED_PENDING_TO_SPENT',
+                });
+              }
+            }
+            break;
+
+          case 'PROOF_NOT_IN_DB':
+            // LOW: Log for audit purposes
+            action = {
+              discrepancy_type: discrepancy.type,
+              action: 'LOGGED_EXTERNAL_PROOF',
+              proof_secret: discrepancy.proof_secret.substring(0, 10) + '...',
+              proof_amount: discrepancy.proof_amount,
+              mint_state: discrepancy.mint_state,
+              success: true,
+              timestamp: new Date().toISOString(),
+            };
+
+            logger.info("LOW severity discrepancy logged", {
+              npub,
+              type: discrepancy.type,
+              proof_amount: discrepancy.proof_amount,
+              mint_state: discrepancy.mint_state,
+            });
+            break;
+
+          case 'DB_UNSPENT_MINT_PENDING':
+            // LOW: Monitor for state resolution
+            action = {
+              discrepancy_type: discrepancy.type,
+              action: 'MONITORING_STATE_RESOLUTION',
+              token_id: discrepancy.token_id,
+              proof_amount: discrepancy.proof_amount,
+              success: true,
+              timestamp: new Date().toISOString(),
+            };
+
+            logger.info("LOW severity discrepancy set for monitoring", {
+              npub,
+              type: discrepancy.type,
+              token_id: discrepancy.token_id,
+            });
+            break;
+
+          default:
+            action = {
+              discrepancy_type: discrepancy.type,
+              action: 'UNKNOWN_TYPE_LOGGED',
+              success: true,
+              timestamp: new Date().toISOString(),
+            };
+        }
+
+        if (action) {
+          actionsPerformed.push(action);
+          if (!action.success) {
+            failedCount++;
+          }
+        }
+
+      } catch (error) {
+        failedCount++;
+        logger.error("Failed to process discrepancy during reconciliation", {
+          npub,
+          discrepancy_type: discrepancy.type,
+          error: error.message,
+        });
+
+        actionsPerformed.push({
+          discrepancy_type: discrepancy.type,
+          action: 'PROCESSING_FAILED',
+          error: error.message,
+          success: false,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+
+    const reconciliationSummary = {
+      totalDiscrepancies: discrepancies.length,
+      resolved: resolvedCount,
+      blocked: 0,
+      failed: failedCount,
+      logged: actionsPerformed.filter(a =>
+        a.action.includes('LOGGED') || a.action.includes('MONITORING')
+      ).length,
+    };
+
+    logger.info("Proof state reconciliation completed", {
+      npub,
+      summary: reconciliationSummary,
+      actionsCount: actionsPerformed.length,
+    });
+
+    return {
+      success: true,
+      blocked: false,
+      highSeverityBlocked: false,
+      actionsPerformed,
+      reconciliationSummary,
+      timestamp: new Date().toISOString(),
+    };
+
+  } catch (error) {
+    logger.error("Proof state reconciliation failed", {
+      npub,
+      discrepancyCount: discrepancies?.length || 0,
+      error: error.message,
+      stack: error.stack?.split('\n').slice(0, 5),
+    });
+
+    throw new Error(`Failed to reconcile proof states: ${error.message}`);
+  }
+}
+
+/**
+ * Perform pre-flight proof state reconciliation for melt operations
+ * This function should be called before any melt operation to ensure proof state consistency
+ * @param {string} npub - User's Nostr npub string
+ * @param {Array} proofs - Array of proofs that will be used in the melt operation
+ * @returns {Promise<Object>} Reconciliation result with operation clearance status
+ * @throws {Error} If HIGH severity discrepancies block the operation
+ */
+export async function performPreFlightReconciliation(npub, proofs) {
+  try {
+    logger.info("Starting pre-flight proof state reconciliation for melt operation", {
+      npub,
+      proofsCount: proofs?.length || 0,
+    });
+
+    // Step 1: Check proof states against mint
+    const stateCheck = await checkProofStates(npub, proofs);
+
+    // Step 2: If no discrepancies, operation can proceed
+    if (stateCheck.consistent) {
+      logger.info("Pre-flight reconciliation passed - no discrepancies detected", {
+        npub,
+        proofsCount: stateCheck.totalProofs,
+        unspentCount: stateCheck.unspentCount,
+      });
+
+      return {
+        success: true,
+        operationCleared: true,
+        discrepanciesFound: false,
+        stateCheck,
+        reconciliationResult: null,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    // Step 3: Discrepancies found - attempt reconciliation
+    logger.warn("Discrepancies detected during pre-flight check - attempting reconciliation", {
+      npub,
+      discrepancyCount: stateCheck.discrepancies.length,
+      severityCounts: stateCheck.severityCounts,
+      hasHighSeverity: stateCheck.hasHighSeverity,
+    });
+
+    const reconciliationResult = await reconcileProofStates(npub, stateCheck.discrepancies);
+
+    // Step 4: Determine if operation can proceed
+    if (reconciliationResult.blocked || reconciliationResult.highSeverityBlocked) {
+      logger.error("Pre-flight reconciliation BLOCKED operation due to HIGH severity discrepancies", {
+        npub,
+        blockedReason: reconciliationResult.reason,
+        highSeverityCount: stateCheck.severityCounts.HIGH,
+      });
+
+      // Throw error to block the melt operation
+      const error = new Error(
+        `Melt operation blocked due to HIGH severity proof state discrepancies. ` +
+        `${stateCheck.severityCounts.HIGH} critical discrepancies detected. ` +
+        `Database state inconsistent with mint ground truth.`
+      );
+      error.code = 'HIGH_SEVERITY_DISCREPANCIES';
+      error.discrepancies = stateCheck.discrepancies.filter(d => d.severity === 'HIGH');
+      error.reconciliationResult = reconciliationResult;
+      throw error;
+    }
+
+    // Step 5: Operation can proceed after reconciliation
+    logger.info("Pre-flight reconciliation completed - operation cleared to proceed", {
+      npub,
+      discrepanciesResolved: reconciliationResult.reconciliationSummary.resolved,
+      totalActions: reconciliationResult.actionsPerformed.length,
+    });
+
+    return {
+      success: true,
+      operationCleared: true,
+      discrepanciesFound: true,
+      discrepanciesResolved: true,
+      stateCheck,
+      reconciliationResult,
+      timestamp: new Date().toISOString(),
+    };
+
+  } catch (error) {
+    // If this is our HIGH severity error, re-throw it
+    if (error.code === 'HIGH_SEVERITY_DISCREPANCIES') {
+      throw error;
+    }
+
+    // For other errors, log and re-throw with context
+    logger.error("Pre-flight reconciliation failed with unexpected error", {
+      npub,
+      proofsCount: proofs?.length || 0,
+      error: error.message,
+      stack: error.stack?.split('\n').slice(0, 5),
+    });
+
+    throw new Error(`Pre-flight reconciliation failed: ${error.message}`);
+  }
+}
+
+/**
+ * Validate proof states before critical operations
+ * Lightweight version for quick validation without full reconciliation
+ * @param {string} npub - User's Nostr npub string
+ * @param {Array} proofs - Array of proofs to validate
+ * @returns {Promise<Object>} Validation result
+ */
+export async function validateProofStatesForOperation(npub, proofs) {
+  try {
+    logger.debug("Validating proof states for operation", {
+      npub,
+      proofsCount: proofs?.length || 0,
+    });
+
+    const stateCheck = await checkProofStates(npub, proofs);
+
+    // Quick check for HIGH severity issues
+    const hasHighSeverity = stateCheck.severityCounts?.HIGH > 0;
+    const hasCriticalIssues = stateCheck.discrepancies?.some(d =>
+      d.severity === 'HIGH' && d.type === 'DB_UNSPENT_MINT_SPENT'
+    );
+
+    return {
+      valid: !hasHighSeverity && !hasCriticalIssues,
+      hasHighSeverity,
+      hasCriticalIssues,
+      discrepancyCount: stateCheck.discrepancies?.length || 0,
+      severityCounts: stateCheck.severityCounts || { HIGH: 0, MEDIUM: 0, LOW: 0 },
+      recommendation: hasHighSeverity ?
+        'PERFORM_FULL_RECONCILIATION' :
+        (stateCheck.discrepancies?.length > 0 ? 'MONITOR_DISCREPANCIES' : 'PROCEED'),
+    };
+
+  } catch (error) {
+    logger.error("Proof state validation failed", {
+      npub,
+      proofsCount: proofs?.length || 0,
+      error: error.message,
+    });
+
+    return {
+      valid: false,
+      error: error.message,
+      recommendation: 'ABORT_OPERATION',
+    };
   }
 }
 
