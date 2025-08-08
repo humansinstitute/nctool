@@ -1,6 +1,9 @@
 # Node.js dependencies
 /node_modules/
 
+# TEMP
+/doc/*
+
 # Logs
 logs
 *.log
