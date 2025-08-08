@@ -442,7 +442,7 @@ async function meltTokens(sessionKey) {
     );
 
     console.log("\n✅ Tokens melted successfully!");
-    console.log(`Amount: ${data.amount} sats`);
+    console.log(`Amount: ${data.paidAmount} sats`);
     if (data.fee) {
       console.log(`Fee: ${data.fee} sats`);
     }
