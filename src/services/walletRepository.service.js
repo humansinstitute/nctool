@@ -719,197 +719,176 @@ class WalletRepositoryService {
    * @throws {Error} If any part of the atomic operation fails
    */
   async executeAtomicMelt(sourceTokenIds, keepProofs, meltChangeProofs, transactionId, metadata) {
-    const session = await mongoose.startSession();
-    
     try {
-      // Mock transaction for test environments that don't support replica sets
-      const executeTransaction = async () => {
-        // Validate required metadata
-        if (!metadata.npub || !metadata.wallet_id || !metadata.mint_url) {
-          throw new Error('Missing required metadata: npub, wallet_id, and mint_url are required');
-        }
-
-        // Enhanced idempotency controls
-        console.log(`[executeAtomicMelt] Starting atomic melt with enhanced controls:`, {
-          transaction_id: transactionId,
-          npub: metadata.npub,
-          source_tokens: sourceTokenIds.length,
-          keep_proofs: keepProofs?.length || 0,
-          melt_change_proofs: meltChangeProofs?.length || 0,
-          timestamp: new Date().toISOString()
-        });
-
-        // 1. Validate transaction ID uniqueness
-        const transactionValidation = await this.validateTransactionId(transactionId, 'melt');
-        if (!transactionValidation.valid) {
-          const error = new Error(`Transaction validation failed: ${transactionValidation.error}`);
-          error.code = transactionValidation.code;
-          error.existingToken = transactionValidation.existingToken;
-          throw error;
-        }
-
-        // 2. Check for duplicate operations
-        const operationParams = {
-          npub: metadata.npub,
-          mint_url: metadata.mint_url,
-          source_token_ids: sourceTokenIds,
-          operation_type: 'atomic_melt',
-          amount: metadata.amount || 0
-        };
-        
-        const operationHash = this.generateOperationHash(operationParams);
-        const duplicateCheck = await this.checkDuplicateOperation(metadata.npub, operationHash);
-        
-        if (duplicateCheck.isDuplicate) {
-          const error = new Error(
-            `Duplicate melt operation detected. Original transaction: ${duplicateCheck.originalTransaction}, ` +
-            `Time since original: ${duplicateCheck.timeSinceOriginal}ms`
-          );
-          error.code = 'DUPLICATE_OPERATION';
-          error.originalTransaction = duplicateCheck.originalTransaction;
-          throw error;
-        }
-
-        // 3. Validate concurrent operation prevention
-        const concurrentCheck = await CashuToken.find({
-          _id: { $in: sourceTokenIds },
-          status: { $ne: 'unspent' }
-        }).session(session);
-
-        if (concurrentCheck.length > 0) {
-          const error = new Error(
-            `Concurrent operation detected. ${concurrentCheck.length} tokens are no longer unspent`
-          );
-          error.code = 'CONCURRENT_OPERATION';
-          error.conflictingTokens = concurrentCheck.map(t => t._id);
-          throw error;
-        }
-
-        // 4. Mark source tokens as spent
-        const spentResult = await CashuToken.updateMany(
-          { _id: { $in: sourceTokenIds } },
-          {
-            $set: {
-              status: "spent",
-              spent_at: new Date(),
-            },
-          },
-          { session }
-        );
-
-        if (spentResult.modifiedCount !== sourceTokenIds.length) {
-          throw new Error(
-            `Failed to mark all source tokens as spent. Expected: ${sourceTokenIds.length}, Modified: ${spentResult.modifiedCount}`
-          );
-        }
-
-        const operations = [];
-        let keepTokenDoc = null;
-        let meltChangeTokenDoc = null;
-
-        // 2. Store keep proofs as change tokens (if any)
-        if (keepProofs && keepProofs.length > 0) {
-          const keepTokenData = {
-            npub: metadata.npub,
-            wallet_id: metadata.wallet_id,
-            proofs: keepProofs,
-            mint_url: metadata.mint_url,
-            status: "unspent",
-            transaction_type: "change",
-            transaction_id: `${transactionId}_keep`,
-            metadata: {
-              source: "change",
-              parent_transaction_id: metadata.parent_transaction_id || transactionId,
-              operation_hash: operationHash,
-              atomic_operation: true,
-              operation_timestamp: new Date().toISOString()
-            },
-          };
-
-          keepTokenDoc = new CashuToken(keepTokenData);
-          await keepTokenDoc.save({ session });
-          operations.push({
-            type: "keep_change",
-            token_id: keepTokenDoc._id,
-            amount: keepTokenDoc.total_amount,
-            proof_count: keepProofs.length,
-          });
-        }
-
-        // 3. Store melt change proofs as change tokens (if any)
-        if (meltChangeProofs && meltChangeProofs.length > 0) {
-          const meltChangeTokenData = {
-            npub: metadata.npub,
-            wallet_id: metadata.wallet_id,
-            proofs: meltChangeProofs,
-            mint_url: metadata.mint_url,
-            status: "unspent",
-            transaction_type: "change",
-            transaction_id: `${transactionId}_melt_change`,
-            metadata: {
-              source: "change",
-              parent_transaction_id: metadata.parent_transaction_id || transactionId,
-              operation_hash: operationHash,
-              atomic_operation: true,
-              operation_timestamp: new Date().toISOString()
-            },
-          };
-
-          meltChangeTokenDoc = new CashuToken(meltChangeTokenData);
-          await meltChangeTokenDoc.save({ session });
-          operations.push({
-            type: "melt_change",
-            token_id: meltChangeTokenDoc._id,
-            amount: meltChangeTokenDoc.total_amount,
-            proof_count: meltChangeProofs.length,
-          });
-        }
-
-        // 4. Audit logging (without storing consumed proofs)
-        const auditLog = {
-          transaction_id: transactionId,
-          operation_type: "atomic_melt",
-          timestamp: new Date(),
-          source_tokens_spent: sourceTokenIds.length,
-          operations_performed: operations,
-          metadata: {
-            npub: metadata.npub,
-            wallet_id: metadata.wallet_id,
-            mint_url: metadata.mint_url,
-            parent_transaction_id: metadata.parent_transaction_id,
-          },
-        };
-
-        // Log audit information (in production, this would go to an audit collection)
-        console.log('[executeAtomicMelt] Audit Log:', JSON.stringify(auditLog, null, 2));
-
-        return {
-          success: true,
-          transaction_id: transactionId,
-          source_tokens_spent: sourceTokenIds.length,
-          keep_token_id: keepTokenDoc?._id,
-          keep_amount: keepTokenDoc?.total_amount || 0,
-          melt_change_token_id: meltChangeTokenDoc?._id,
-          melt_change_amount: meltChangeTokenDoc?.total_amount || 0,
-          operations,
-          audit_log: auditLog,
-        };
-      };
-
-      // Use withTransaction if available (replica set), otherwise execute directly
-      let result;
-      if (session.withTransaction && process.env.NODE_ENV !== 'test') {
-        result = await session.withTransaction(executeTransaction, {
-          readPreference: 'primary',
-          readConcern: { level: 'local' },
-          writeConcern: { w: 'majority' }
-        });
-      } else {
-        // For test environments or non-replica set MongoDB
-        result = await executeTransaction();
+      // Validate required metadata
+      if (!metadata.npub || !metadata.wallet_id || !metadata.mint_url) {
+        throw new Error('Missing required metadata: npub, wallet_id, and mint_url are required');
       }
 
-      return result;
+      // Enhanced idempotency controls
+      console.log(`[executeAtomicMelt] Starting atomic melt with enhanced controls:`, {
+        transaction_id: transactionId,
+        npub: metadata.npub,
+        source_tokens: sourceTokenIds.length,
+        keep_proofs: keepProofs?.length || 0,
+        melt_change_proofs: meltChangeProofs?.length || 0,
+        timestamp: new Date().toISOString()
+      });
+
+      // 1. Validate transaction ID uniqueness
+      const transactionValidation = await this.validateTransactionId(transactionId, 'melt');
+      if (!transactionValidation.valid) {
+        const error = new Error(`Transaction validation failed: ${transactionValidation.error}`);
+        error.code = transactionValidation.code;
+        error.existingToken = transactionValidation.existingToken;
+        throw error;
+      }
+
+      // 2. Check for duplicate operations
+      const operationParams = {
+        npub: metadata.npub,
+        mint_url: metadata.mint_url,
+        source_token_ids: sourceTokenIds,
+        operation_type: 'atomic_melt',
+        amount: metadata.amount || 0
+      };
+      
+      const operationHash = this.generateOperationHash(operationParams);
+      const duplicateCheck = await this.checkDuplicateOperation(metadata.npub, operationHash);
+      
+      if (duplicateCheck.isDuplicate) {
+        const error = new Error(
+          `Duplicate melt operation detected. Original transaction: ${duplicateCheck.originalTransaction}, ` +
+          `Time since original: ${duplicateCheck.timeSinceOriginal}ms`
+        );
+        error.code = 'DUPLICATE_OPERATION';
+        error.originalTransaction = duplicateCheck.originalTransaction;
+        throw error;
+      }
+
+      // 3. Validate concurrent operation prevention
+      const concurrentCheck = await CashuToken.find({
+        _id: { $in: sourceTokenIds },
+        status: { $ne: 'unspent' }
+      });
+
+      if (concurrentCheck.length > 0) {
+        const error = new Error(
+          `Concurrent operation detected. ${concurrentCheck.length} tokens are no longer unspent`
+        );
+        error.code = 'CONCURRENT_OPERATION';
+        error.conflictingTokens = concurrentCheck.map(t => t._id);
+        throw error;
+      }
+
+      // 4. Mark source tokens as spent
+      const spentResult = await CashuToken.updateMany(
+        { _id: { $in: sourceTokenIds } },
+        {
+          $set: {
+            status: "spent",
+            spent_at: new Date(),
+          },
+        }
+      );
+
+      if (spentResult.modifiedCount !== sourceTokenIds.length) {
+        throw new Error(
+          `Failed to mark all source tokens as spent. Expected: ${sourceTokenIds.length}, Modified: ${spentResult.modifiedCount}`
+        );
+      }
+
+      const operations = [];
+      let keepTokenDoc = null;
+      let meltChangeTokenDoc = null;
+
+      // 5. Store keep proofs as change tokens (if any)
+      if (keepProofs && keepProofs.length > 0) {
+        const keepTokenData = {
+          npub: metadata.npub,
+          wallet_id: metadata.wallet_id,
+          proofs: keepProofs,
+          mint_url: metadata.mint_url,
+          status: "unspent",
+          transaction_type: "change",
+          transaction_id: `${transactionId}_keep`,
+          metadata: {
+            source: "change",
+            parent_transaction_id: metadata.parent_transaction_id || transactionId,
+            operation_hash: operationHash,
+            atomic_operation: true,
+            operation_timestamp: new Date().toISOString()
+          },
+        };
+
+        keepTokenDoc = new CashuToken(keepTokenData);
+        await keepTokenDoc.save();
+        operations.push({
+          type: "keep_change",
+          token_id: keepTokenDoc._id,
+          amount: keepTokenDoc.total_amount,
+          proof_count: keepProofs.length,
+        });
+      }
+
+      // 6. Store melt change proofs as change tokens (if any)
+      if (meltChangeProofs && meltChangeProofs.length > 0) {
+        const meltChangeTokenData = {
+          npub: metadata.npub,
+          wallet_id: metadata.wallet_id,
+          proofs: meltChangeProofs,
+          mint_url: metadata.mint_url,
+          status: "unspent",
+          transaction_type: "change",
+          transaction_id: `${transactionId}_melt_change`,
+          metadata: {
+            source: "change",
+            parent_transaction_id: metadata.parent_transaction_id || transactionId,
+            operation_hash: operationHash,
+            atomic_operation: true,
+            operation_timestamp: new Date().toISOString()
+          },
+        };
+
+        meltChangeTokenDoc = new CashuToken(meltChangeTokenData);
+        await meltChangeTokenDoc.save();
+        operations.push({
+          type: "melt_change",
+          token_id: meltChangeTokenDoc._id,
+          amount: meltChangeTokenDoc.total_amount,
+          proof_count: meltChangeProofs.length,
+        });
+      }
+
+      // 7. Audit logging (without storing consumed proofs)
+      const auditLog = {
+        transaction_id: transactionId,
+        operation_type: "atomic_melt",
+        timestamp: new Date(),
+        source_tokens_spent: sourceTokenIds.length,
+        operations_performed: operations,
+        metadata: {
+          npub: metadata.npub,
+          wallet_id: metadata.wallet_id,
+          mint_url: metadata.mint_url,
+          parent_transaction_id: metadata.parent_transaction_id,
+        },
+      };
+
+      // Log audit information (in production, this would go to an audit collection)
+      console.log('[executeAtomicMelt] Audit Log:', JSON.stringify(auditLog, null, 2));
+
+      return {
+        success: true,
+        transaction_id: transactionId,
+        source_tokens_spent: sourceTokenIds.length,
+        keep_token_id: keepTokenDoc?._id,
+        keep_amount: keepTokenDoc?.total_amount || 0,
+        melt_change_token_id: meltChangeTokenDoc?._id,
+        melt_change_amount: meltChangeTokenDoc?.total_amount || 0,
+        operations,
+        audit_log: auditLog,
+      };
 
     } catch (error) {
       // Enhanced error logging for debugging
@@ -924,8 +903,6 @@ class WalletRepositoryService {
       });
 
       throw new Error(`Atomic melt transaction failed: ${error.message}`);
-    } finally {
-      await session.endSession();
     }
   }
 
