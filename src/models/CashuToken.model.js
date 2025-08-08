@@ -120,14 +120,34 @@ const CashuTokenSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["unspent", "spent", "pending"],
+      enum: ["unspent", "spent", "pending", "failed"],
       default: "unspent",
       required: true,
+      validate: {
+        validator: function(value) {
+          // Prevent storing "melted" tokens with consumed proofs in spent status
+          if (this.transaction_type === "melted" && value === "spent" && this.proofs && this.proofs.length > 0) {
+            return false;
+          }
+          return true;
+        },
+        message: "Cannot store melted tokens with consumed proofs in spent status - use atomic melt operations instead"
+      }
     },
     transaction_type: {
       type: String,
-      enum: ["received", "sent", "minted", "melted", "change"],
+      enum: ["received", "sent", "minted", "change"],
       required: [true, "Transaction type is required"],
+      validate: {
+        validator: function(value) {
+          // Prevent creation of "melted" transaction type to avoid double-counting
+          if (value === "melted") {
+            return false;
+          }
+          return true;
+        },
+        message: "Transaction type 'melted' is deprecated - use atomic melt operations with 'change' type instead"
+      }
     },
     transaction_id: {
       type: String,
@@ -160,6 +180,19 @@ const CashuTokenSchema = new mongoose.Schema(
         trim: true,
         // Reference to parent transaction for change tokens
       },
+      operation_hash: {
+        type: String,
+        trim: true,
+        // Hash for idempotency control
+      },
+      atomic_operation: {
+        type: Boolean,
+        // Flag for atomic operations
+      },
+      operation_timestamp: {
+        type: String,
+        // Timestamp for operation tracking
+      },
     },
     spent_at: {
       type: Date,
@@ -181,8 +214,24 @@ CashuTokenSchema.index({ wallet_id: 1, status: 1 });
 CashuTokenSchema.index({ transaction_id: 1 }, { unique: true });
 CashuTokenSchema.index({ mint_url: 1, status: 1 });
 
+// Enhanced indexes for melt operations
+CashuTokenSchema.index({ npub: 1, mint_url: 1, status: 1 });
+CashuTokenSchema.index({ npub: 1, transaction_type: 1, status: 1 });
+CashuTokenSchema.index({ "metadata.parent_transaction_id": 1 });
+CashuTokenSchema.index({ spent_at: 1 });
+
 // Index for proof secret lookups (for double-spend prevention)
 CashuTokenSchema.index({ "proofs.secret": 1 });
+
+// Sparse index for atomic transaction patterns
+CashuTokenSchema.index({
+  transaction_id: 1,
+  transaction_type: 1,
+  status: 1
+}, {
+  name: "atomic_transaction_lookup",
+  background: true
+});
 
 /**
  * Pre-save middleware to calculate total_amount, validate status-dependent rules, and set spent_at
@@ -206,9 +255,42 @@ CashuTokenSchema.pre("save", function (next) {
     );
   }
 
+  // Enhanced validation for atomic transaction patterns
+  if (this.transaction_type === "change") {
+    // Change tokens must have valid parent transaction reference
+    if (!this.metadata || !this.metadata.parent_transaction_id) {
+      return next(
+        new Error("Change tokens must have parent_transaction_id in metadata")
+      );
+    }
+    
+    // Change tokens should not be created in spent status
+    if (this.status === "spent") {
+      return next(
+        new Error("Change tokens cannot be created in spent status")
+      );
+    }
+  }
+
+  // Validate transaction ID patterns for atomic operations
+  if (this.transaction_id) {
+    // Ensure atomic transaction IDs follow proper naming convention
+    if (this.transaction_type === "change" &&
+        !this.transaction_id.includes("_keep") &&
+        !this.transaction_id.includes("_melt_change")) {
+      // Allow legacy change transactions but log for monitoring
+      console.warn(`[CashuToken] Change token with non-atomic transaction ID pattern: ${this.transaction_id}`);
+    }
+  }
+
   // Set spent_at timestamp when status changes to spent
   if (this.status === "spent" && !this.spent_at) {
     this.spent_at = new Date();
+  }
+
+  // Clear spent_at if status changes away from spent
+  if (this.status !== "spent" && this.spent_at) {
+    this.spent_at = null;
   }
 
   next();
