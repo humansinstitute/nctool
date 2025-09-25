@@ -882,6 +882,30 @@ export async function sendTokens(npub, amount, recipientPubkey = null) {
 
     const { wallet, walletDoc } = await initializeWallet(npub);
 
+    // Normalize recipient key if provided (accept npub, compressed hex, or x-only hex)
+    let normalizedRecipient = null;
+    if (recipientPubkey && typeof recipientPubkey === "string" && recipientPubkey.trim() !== "") {
+      try {
+        let key = recipientPubkey.trim();
+        if (key.startsWith("npub1")) {
+          const { data } = nip19.decode(key);
+          key = data; // 32-byte hex (x-only)
+        }
+        // If compressed SEC key (02/03 + 32 bytes), strip prefix to x-only
+        if (/^(02|03)[0-9a-fA-F]{64}$/.test(key)) {
+          key = key.slice(2);
+        }
+        // Validate x-only 32-byte hex
+        if (!/^[0-9a-fA-F]{64}$/.test(key)) {
+          throw new Error("Invalid recipient public key format. Provide npub or 64-hex x-only key.");
+        }
+        normalizedRecipient = key.toLowerCase();
+      } catch (e) {
+        logger.warn("Recipient pubkey normalization failed", { recipientPubkey, error: e.message });
+        throw new Error(e.message || "Invalid recipient public key");
+      }
+    }
+
     // Select tokens for spending
     const selection = await walletRepositoryService.selectTokensForSpending(
       npub,
@@ -906,7 +930,7 @@ export async function sendTokens(npub, amount, recipientPubkey = null) {
     }
 
     // Create send transaction with optional P2PK
-    const sendOptions = recipientPubkey ? { pubkey: recipientPubkey } : {};
+    const sendOptions = normalizedRecipient ? { pubkey: normalizedRecipient } : {};
     const sendResponse = await wallet.send(amount, allProofs, sendOptions);
 
     logger.info("Created send transaction", {
@@ -974,7 +998,7 @@ export async function sendTokens(npub, amount, recipientPubkey = null) {
       transactionId,
       amount,
       changeAmount: selection.change_amount,
-      recipientPubkey,
+      recipientPubkey: normalizedRecipient || null,
       mintUrl: MINT_URL,
     };
   } catch (error) {

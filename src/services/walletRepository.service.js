@@ -73,6 +73,50 @@ class WalletRepositoryService {
   }
 
   /**
+   * Delete a wallet by npub and mint URL
+   * @param {string} npub
+   * @param {string} mintUrl
+   * @returns {Promise<{deletedCount:number}>}
+   */
+  async deleteWallet(npub, mintUrl) {
+    try {
+      const result = await CashuWallet.deleteOne({ npub, mint_url: mintUrl });
+      return { deletedCount: result.deletedCount || 0 };
+    } catch (error) {
+      throw new Error(`Failed to delete wallet: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete all tokens for a wallet (by npub and mint URL)
+   * @param {string} npub
+   * @param {string} mintUrl
+   * @returns {Promise<{deletedCount:number}>}
+   */
+  async deleteTokens(npub, mintUrl) {
+    try {
+      const result = await CashuToken.deleteMany({ npub, mint_url: mintUrl });
+      return { deletedCount: result.deletedCount || 0 };
+    } catch (error) {
+      throw new Error(`Failed to delete tokens: ${error.message}`);
+    }
+  }
+
+  /**
+   * Count unspent tokens for a wallet
+   * @param {string} npub
+   * @param {string} mintUrl
+   * @returns {Promise<number>}
+   */
+  async countUnspentTokens(npub, mintUrl) {
+    try {
+      return await CashuToken.countDocuments({ npub, mint_url: mintUrl, status: "unspent" });
+    } catch (error) {
+      throw new Error(`Failed to count unspent tokens: ${error.message}`);
+    }
+  }
+
+  /**
    * Update wallet configuration
    * @param {string} npub - User's NPUB
    * @param {string} mintUrl - Mint URL

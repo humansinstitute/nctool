@@ -17,7 +17,9 @@ import { mineEventPow } from "./src/services/pow.service.js";
 import { v4 as uuidv4 } from "uuid";
 import logUpdate from "log-update";
 
-const API_BASE = process.env.API_URL || "http://localhost:3000";
+const API_BASE = process.env.API_URL || "http://localhost:3041";
+// Log which API server we're targeting
+console.log(`Using API server: ${API_BASE}`);
 const IGNORE_OLD_MS = Number(process.env.IGNORE_OLD) || Infinity;
 
 // Buffer and renderer for streaming messages
@@ -248,9 +250,10 @@ async function cashuWalletMenu(sessionKey) {
     console.log("6) Check proof states");
     console.log("7) View transaction history");
     console.log("8) Get wallet info");
-    console.log("9) Return to main menu");
+    console.log("9) Delete wallet (DANGEROUS)");
+    console.log("0) Return to main menu");
 
-    const choice = await prompt("Enter 1-9: ");
+    const choice = await prompt("Enter 0-9: ");
 
     try {
       switch (choice) {
@@ -279,6 +282,9 @@ async function cashuWalletMenu(sessionKey) {
           await getWalletInfo(sessionKey);
           break;
         case "9":
+          await deleteWalletCli(sessionKey);
+          break;
+        case "0":
           return; // Return to main menu
         default:
           console.log("Invalid choice. Please enter 1-9.");
@@ -418,6 +424,61 @@ async function receiveTokens(sessionKey) {
     }
   } catch (err) {
     throw err;
+  }
+}
+
+async function deleteWalletCli(sessionKey) {
+  console.log("\n--- Delete Wallet (DANGEROUS) ---");
+  console.log("This will delete your wallet and ALL stored tokens for this mint on the server.");
+  console.log("If you have unspent tokens, deletion is blocked unless you force it.");
+  const confirm = await prompt('Type "DELETE" to confirm, or press Enter to cancel: ');
+  if (confirm !== "DELETE") {
+    console.log("Cancelled.");
+    return;
+  }
+
+  const forceAns = await prompt("Force deletion even if unspent tokens exist? (y/N): ");
+  const force = String(forceAns || "N").toLowerCase() === "y";
+  try {
+    // Fetch wallet list to select mint
+    const infoUrl = `${API_BASE}/api/wallet/${sessionKey.npub}/info`;
+    const infoResp = await axios.get(infoUrl);
+    const wallets = infoResp.data?.walletInfo?.statistics?.wallets || [];
+
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      console.log("No wallets found for this user.");
+      return;
+    }
+
+    let mintUrlToDelete;
+    if (wallets.length === 1) {
+      mintUrlToDelete = wallets[0].mint_url;
+      console.log(`Deleting only wallet for mint: ${mintUrlToDelete}`);
+    } else {
+      console.log("Select a wallet to delete:");
+      wallets.forEach((w, i) => console.log(`${i + 1}) ${w.mint_url}`));
+      const choiceStr = await prompt(`Enter 1-${wallets.length}: `);
+      const idx = parseInt(choiceStr, 10) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= wallets.length) {
+        console.log("Invalid selection. Aborting.");
+        return;
+      }
+      mintUrlToDelete = wallets[idx].mint_url;
+    }
+
+    const url = `${API_BASE}/api/wallet/${sessionKey.npub}`;
+    const { data } = await axios.delete(url, { params: { force, mint_url: mintUrlToDelete } });
+    if (data.success) {
+      console.log("\n✅ Wallet deleted.");
+      console.log(`Mint: ${data.mintUrl || mintUrlToDelete}`);
+      console.log(`Tokens deleted: ${data.tokensDeleted}`);
+      console.log(`Wallet record deleted: ${data.walletDeleted}`);
+    } else {
+      console.log("\nUnexpected response:", data);
+    }
+  } catch (err) {
+    const errorMsg = err.response?.data || { message: err.message };
+    console.error("\n❌ Failed to delete wallet:", typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg, null, 2));
   }
 }
 
@@ -611,20 +672,6 @@ async function getWalletInfo(sessionKey) {
 
 async function main() {
   await connectDB();
-
-  // Attempt to start NostrMQ Remote API (graceful degradation on failure)
-  let nostrMq;
-  try {
-    nostrMq = new NostrMQService();
-    await nostrMq.initialize();
-    await nostrMq.start();
-    console.log("✅ NostrMQ remote API enabled");
-  } catch (err) {
-    console.warn(
-      "⚠️  NostrMQ failed to start, continuing without remote API:",
-      err.message || err
-    );
-  }
 
   const sessionKey = await chooseKey();
   tailEvents(sessionKey);

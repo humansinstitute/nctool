@@ -938,6 +938,82 @@ export const getWalletInfo = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Delete wallet and all associated tokens for a user
+ * DELETE /api/wallet/:npub?mint_url=...&force=true
+ */
+export const deleteWallet = asyncHandler(async (req, res) => {
+  const { npub } = req.params;
+  let mintUrl = req.query.mint_url; // may be undefined
+  const force = String(req.query.force || "false").toLowerCase() === "true";
+
+  logger.warn("Wallet deletion requested", { npub, mintUrl: mintUrl || '(auto)', force });
+
+  if (!npub) return res.status(400).json({ error: "npub is required" });
+
+  // Validate npub format
+  try {
+    nip19.decode(npub);
+  } catch (error) {
+    return res.status(400).json({ error: "Invalid npub format" });
+  }
+
+  // Ensure user exists
+  const keys = await getAllKeys();
+  const keyObj = keys.find((k) => k.npub === npub);
+  if (!keyObj) return res.status(404).json({ error: "User not found" });
+
+  // If mint_url not provided, infer behavior from existing wallets
+  if (!mintUrl) {
+    const wallets = await walletRepositoryService.findWalletsByNpub(npub);
+    if (wallets.length === 0) {
+      return res.status(404).json({ error: "No wallet found for user" });
+    }
+    if (wallets.length > 1) {
+      return res.status(400).json({
+        error: "Multiple wallets found. Specify mint_url to delete a specific wallet.",
+        wallets: wallets.map((w) => ({ id: w._id, mint_url: w.mint_url })),
+      });
+    }
+    mintUrl = wallets[0].mint_url;
+  }
+
+  // Check wallet exists for specified/derived mint
+  const wallet = await walletRepositoryService.findWallet(npub, mintUrl);
+  if (!wallet) {
+    return res.status(404).json({ error: "Wallet not found for mint" });
+  }
+
+  // Safety: block deletion if unspent tokens exist and not forcing
+  const unspentCount = await walletRepositoryService.countUnspentTokens(npub, mintUrl);
+  if (unspentCount > 0 && !force) {
+    return res.status(400).json({
+      error: "Unspent tokens exist",
+      message: "Wallet has unspent tokens. Use force=true to delete anyway.",
+      unspentTokens: unspentCount,
+      mintUrl,
+    });
+  }
+
+  // Delete tokens then wallet
+  const tokenResult = await walletRepositoryService.deleteTokens(npub, mintUrl);
+  const walletResult = await walletRepositoryService.deleteWallet(npub, mintUrl);
+
+  logger.warn("Wallet deletion completed", {
+    npub,
+    mintUrl,
+    tokensDeleted: tokenResult.deletedCount,
+    walletDeleted: walletResult.deletedCount === 1,
+  });
+
+  res.json({
+    success: true,
+    mintUrl,
+    tokensDeleted: tokenResult.deletedCount,
+    walletDeleted: walletResult.deletedCount === 1,
+  });
+});
+
+/**
  * Check pending receipts and automatically complete paid minting operations
  * GET /api/wallet/:npub/receipts/check
  */

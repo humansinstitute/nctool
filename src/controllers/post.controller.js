@@ -1,5 +1,6 @@
 import {
   connect,
+  connectWithRetry,
   publishEncryptedEvent,
   buildTextNote,
 } from "../services/nostr.service.js";
@@ -21,7 +22,7 @@ export const createPost = asyncHandler(async (req, res) => {
   const powBits = DEFAULT_POW;
   const timeout = DEFAULT_TIMEOUT;
 
-  const { ndk } = await connect();
+  const { ndk } = await connectWithRetry();
   const evt = new NDKEvent(ndk, { kind, content });
   await evt.sign();
 
@@ -45,7 +46,7 @@ export const viewPosts = asyncHandler(async (req, res) => {
     kinds = [0, 1];
   }
 
-  const { ndk, npub: defaultNpub } = await connect();
+  const { ndk, npub: defaultNpub } = await connectWithRetry();
   let pubHex;
   if (req.query.npub) {
     pubHex = nip19.decode(req.query.npub).data;
@@ -73,6 +74,9 @@ export const viewPosts = asyncHandler(async (req, res) => {
  * @returns {Promise<{ relays: string[], latestEvents: Array<{id:string,kind:number,content:string,created_at:number}> }>}
  */
 export async function postNoteService({ npub, content, powBits = DEFAULT_POW, timeoutMs = DEFAULT_TIMEOUT }) {
+  const maxAttempts = parseInt(process.env.RETRY_MAX_ATTEMPTS) || 2;
+  const baseDelay = parseInt(process.env.RETRY_BASE_DELAY) || 1000;
+  
   if (!npub || !content) {
     throw Object.assign(new Error("npub and content are required"), { status: 400 });
   }
@@ -83,20 +87,62 @@ export async function postNoteService({ npub, content, powBits = DEFAULT_POW, ti
     throw Object.assign(new Error("Unknown npub for note"), { status: 400 });
   }
 
-  const { ndk } = await connect(keyObj);
-  const noteEvent = new NDKEvent(ndk, { kind: NDKKind.Text, content });
+  let { ndk } = await connectWithRetry(keyObj);
+  let noteEvent = new NDKEvent(ndk, { kind: NDKKind.Text, content });
   await noteEvent.sign();
 
-  const minedRaw = await mineEventPow(noteEvent, powBits);
-  const minedEv = new NDKEvent(ndk, minedRaw);
+  let minedRaw = await mineEventPow(noteEvent, powBits);
+  let minedEv = new NDKEvent(ndk, minedRaw);
   await minedEv.sign();
 
+  // Publish with retry logic
+  let lastError;
   let okRelays;
-  try {
-    okRelays = await minedEv.publish(undefined, timeoutMs);
-  } catch (err) {
-    err.status = err.status || 500;
-    throw err;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`Publish attempt ${attempt}/${maxAttempts}...`);
+      okRelays = await minedEv.publish(undefined, timeoutMs);
+      
+      if (!okRelays || okRelays.size === 0) {
+        throw new Error("No relays received the event");
+      }
+      
+      break; // Success, exit retry loop
+    } catch (err) {
+      lastError = err;
+      console.log(`Publish attempt ${attempt} failed: ${err.message}`);
+      
+      if (attempt < maxAttempts) {
+        // Refresh connections before retry
+        console.log("Refreshing connections before retry...");
+        try {
+          const refreshedConnection = await connectWithRetry(keyObj);
+          ndk = refreshedConnection.ndk;
+          
+          // Rebuild event with fresh connections
+          noteEvent = new NDKEvent(ndk, { kind: NDKKind.Text, content });
+          await noteEvent.sign();
+          
+          minedRaw = await mineEventPow(noteEvent, powBits);
+          minedEv = new NDKEvent(ndk, minedRaw);
+          await minedEv.sign();
+        } catch (connectionErr) {
+          console.error("Failed to refresh connections:", connectionErr.message);
+        }
+        
+        // Exponential backoff delay
+        const delay = baseDelay * (2 ** (attempt - 1));
+        console.log(`Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  // Check if all attempts failed
+  if (!okRelays || okRelays.size === 0) {
+    const error = new Error(`Failed to publish after ${maxAttempts} attempts. Last error: ${lastError.message}`);
+    error.status = lastError.status || 500;
+    throw error;
   }
 
   const { data: pubHex } = nip19.decode(npub);
@@ -211,7 +257,7 @@ export const broadcastEvent = asyncHandler(async (req, res) => {
   if (!event) {
     return res.status(400).json({ error: "event is required" });
   }
-  const { ndk } = await connect();
+  const { ndk } = await connectWithRetry();
   const ndkEvent = new NDKEvent(ndk, event);
   const okRelays = await ndkEvent.publish(undefined, DEFAULT_TIMEOUT);
   res.json({ id: ndkEvent.id, relays: [...okRelays].map((r) => r.url) });

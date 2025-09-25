@@ -36,7 +36,7 @@ npm install
 npm start
 ```
 
-The server will start on `http://localhost:3000` by default.
+The server will start on `http://localhost:3041` by default.
 
 ### Run the Test Client
 
@@ -134,7 +134,7 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 
 ### Core Application
 - `MONGO_URI` / `MONGODB_URI`: MongoDB connection string
-- `PORT`: Server port (default: `3000`)
+- `PORT`: Server port (default: `3041`)
 
 ### Nostr Configuration
 - `NOSTR_RELAY_MODE`: Relay connection mode - `local` or `remote` (default: `local`)
@@ -144,9 +144,10 @@ GET /api/wallet/:npub/proofs/status?proofs=[{"id":"...","amount":100,"secret":".
 
 ### Cashu Configuration
 - `MINT_URL`: Cashu mint URL (default: `https://mint.minibits.cash/Bitcoin`)
+- `CASHUWALL_MIN_SATS`: Minimum sats required for paywall redemption (default: `21`)
 
 ### Test Client
-- `API_URL`: Base URL for the API server (default: `http://localhost:3000`)
+- `API_URL`: Base URL for the API server (default: `http://localhost:3041`)
 - `POW_BITS`: Default proof-of-work difficulty (default: `20`)
 - `TIMEOUT_MS`: Default timeout for publishing events in milliseconds (default: `10000`)
 - `IGNORE_OLD`: Milliseconds threshold for ignoring old messages (default: no limit)

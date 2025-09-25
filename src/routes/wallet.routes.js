@@ -141,4 +141,12 @@ router.post("/:npub/cleanup", walletController.cleanupStuckTransactions);
 router.get("/:npub/recovery/stats", walletController.getRecoveryStats);
 router.get("/:npub/receipts/check", walletController.checkPendingReceipts);
 
+// ==================== ADMIN/MAINTENANCE ====================
+/**
+ * Delete a wallet and all associated tokens for a user (dangerous)
+ * DELETE /api/wallet/:npub?mint_url=...&force=true
+ * - If force is not true and unspent tokens exist, deletion is blocked
+ */
+router.delete("/:npub", walletController.deleteWallet);
+
 export default router;
