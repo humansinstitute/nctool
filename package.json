@@ -16,6 +16,10 @@
     "@cashu/cashu-ts": "^2.5.2",
     "@nostr-dev-kit/ndk": "^2.13.3",
     "axios": "^1.9.0",
+    "applesauce-core": "^3.1.0",
+    "applesauce-relay": "^3.1.0",
+    "applesauce-loaders": "^3.1.0",
+    
     "dotenv": "^16.5.0",
     "eventsource": "^3.0.6",
     "express": "^5.1.0",

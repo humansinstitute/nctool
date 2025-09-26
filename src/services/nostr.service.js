@@ -3,6 +3,9 @@ import NDK, {
   NDKEvent,
   NDKKind,
 } from "@nostr-dev-kit/ndk";
+// Ensure WebSocket is available in Node for NDK
+import WebSocket from "ws";
+import dns from "dns";
 import { nip19, nip04 } from "nostr-tools";
 import { getAllKeys } from "./identity.service.js";
 import { mineEventPow } from "./pow.service.js";
@@ -82,7 +85,22 @@ const DEFAULT_TIMEOUT = Number(process.env.TIMEOUT_MS) || 5000;
 // Connection retry configuration
 const RETRY_MAX_ATTEMPTS = parseInt(process.env.RETRY_MAX_ATTEMPTS) || 3;
 const RETRY_BASE_DELAY = parseInt(process.env.RETRY_BASE_DELAY) || 1000;
-const CONNECTION_WAIT_TIMEOUT = parseInt(process.env.CONNECTION_WAIT_TIMEOUT) || 5000;
+const CONNECTION_WAIT_TIMEOUT = parseInt(process.env.CONNECTION_WAIT_TIMEOUT) || 10000;
+
+// Prefer IPv4 to avoid IPv6 routing issues some networks exhibit
+try {
+  dns.setDefaultResultOrder && dns.setDefaultResultOrder("ipv4first");
+} catch {}
+
+// Attach ws to global if missing to ensure NDK uses it in Node
+if (typeof globalThis.WebSocket === "undefined") {
+  // ws exports WebSocket as default in ESM; for safety, handle both shapes
+  const WS = WebSocket?.WebSocket || WebSocket;
+  if (WS) {
+    globalThis.WebSocket = WS;
+    console.log("Nostr Service: Bound ws.WebSocket to global WebSocket for NDK");
+  }
+}
 
 /**
  * Connects to Nostr relays with a singleton NDK instance.
@@ -120,7 +138,11 @@ export async function connect(keyObj) {
 
   const ndk = new NDK({
     explicitRelayUrls: selectedRelays,
-    initialValidationRatio: 0.2, // Or your preferred setting
+    // Lower validation to avoid delays on connect when many relays are slow
+    initialValidationRatio: 0.1,
+    autoConnectUserRelays: false,
+    // Ensure NDK uses Node ws
+    websocketImplementation: globalThis.WebSocket,
   });
   ndk.signer = signer;
 
@@ -128,21 +150,21 @@ export async function connect(keyObj) {
     `Nostr Service: Attempting to connect to ${selectedRelays.length} relays...`
   );
   try {
-    await ndk.connect(DEFAULT_TIMEOUT); // Using DEFAULT_TIMEOUT
+    await ndk.connect(Math.max(DEFAULT_TIMEOUT, 8000));
 
-    const connectedRelays = Array.from(ndk.pool.relays.values()).filter(
-      (r) => r.status === r.constructor.OPEN
-    );
+    const relays = Array.from(ndk.pool.relays.values());
+    const connectedRelays = relays.filter((r) => r.status === r.constructor.OPEN);
     if (connectedRelays.length > 0) {
       console.log(
         `Nostr Service: Successfully connected to ${connectedRelays.length} relay(s):`,
         connectedRelays.map((r) => r.url)
       );
     } else {
+      const statuses = relays.map((r) => ({ url: r.url, status: r.status }));
       console.warn(
-        "Nostr Service: No relays are connected after connect(). This may be normal for streaming, but will cause publishing to fail. Check relay URLs, network connectivity, and .env settings if you experience issues."
+        "Nostr Service: No relays are connected after connect(). Statuses:",
+        statuses
       );
-      // Do not throw here; allow streaming and other uses to proceed.
     }
   } catch (error) {
     console.error("Nostr Service: Error during NDK connect:", error);

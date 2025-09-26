@@ -251,6 +251,7 @@ async function cashuWalletMenu(sessionKey) {
     console.log("7) View transaction history");
     console.log("8) Get wallet info");
     console.log("9) Delete wallet (DANGEROUS)");
+    console.log("10) Zap (tip) a Nostr user");
     console.log("0) Return to main menu");
 
     const choice = await prompt("Enter 0-9: ");
@@ -283,6 +284,9 @@ async function cashuWalletMenu(sessionKey) {
           break;
         case "9":
           await deleteWalletCli(sessionKey);
+          break;
+        case "10":
+          await zapToUser(sessionKey);
           break;
         case "0":
           return; // Return to main menu
@@ -667,6 +671,44 @@ async function getWalletInfo(sessionKey) {
     }
   } catch (err) {
     throw err;
+  }
+}
+
+async function zapToUser(sessionKey) {
+  console.log("\n--- Zap (Lightning tip) ---");
+  const recipientNpub = await prompt("Recipient npub: ");
+  if (!recipientNpub || !recipientNpub.startsWith("npub1")) {
+    console.log("❌ Please enter a valid recipient npub.");
+    return;
+  }
+  const amountStr = await prompt("Amount in sats: ");
+  const amount = parseInt(amountStr, 10);
+  if (!Number.isInteger(amount) || amount <= 0) {
+    console.log("❌ Invalid amount. Enter a positive integer.");
+    return;
+  }
+
+  console.log(`\nSending ${amount} sats to ${recipientNpub}...`);
+  try {
+    const { data } = await axios.post(`${API_BASE}/api/zap`, {
+      senderNpub: sessionKey.npub,
+      recipientNpub,
+      amount,
+    });
+    if (data.success) {
+      const d = data.data || {};
+      console.log("\n✅ Zap sent!");
+      console.log(`Amount: ${d.amount} sats`);
+      console.log(`Recipient: ${d.recipientName || d.recipientNpub}`);
+      if (d.transactionId) console.log(`Transaction: ${d.transactionId}`);
+      if (d.zapReceiptId) console.log(`Zap Receipt: ${d.zapReceiptId}`);
+      if (d.donationNoteId) console.log(`Donation Note: ${d.donationNoteId}`);
+    } else {
+      console.log(`❌ Zap failed: ${data.error?.message || "unknown error"}`);
+    }
+  } catch (err) {
+    const msg = err.response?.data?.error?.message || err.message || String(err);
+    console.log(`❌ Zap failed: ${msg}`);
   }
 }
 
